@@ -287,34 +287,37 @@ class BreakViewTests(unittest.TestCase):
         self.assertFalse(self._break().show_action_buttons)
 
 
-class ReturningStateTests(unittest.TestCase):
-    """После перерыва счётчики стоят намеренно — это нужно объяснить."""
+class AfterBreakTests(unittest.TestCase):
+    """После перерыва счётчик сессии продолжается сразу, без выдержки.
 
-    def _returning(self, seconds_in_state: float = 20.0):
-        snapshot = FakeSnapshot()
-        snapshot.seconds_in_state = seconds_in_state
+    Раньше здесь было состояние RETURNING: экран показывал «Отсчёт
+    приостановлен» и обратный отсчёт до возобновления. Эти тесты падают
+    на старом коде.
+    """
+
+    def _after_break(self, work_sec: float = 740.0):
         return build_main_screen_view(
-            snapshot,
-            signals(state=UserState.RETURNING),
-            assessment(state=UserState.RETURNING, work_sec=740.0),
+            FakeSnapshot(),
+            signals(state=UserState.ACTIVE_WORK),
+            assessment(state=UserState.ACTIVE_WORK, work_sec=work_sec),
             now=time.monotonic(),
-            returning_duration_sec=60.0,
             eye_rest_after_sec=EYE_REST,
             microbreak_after_sec=MICROBREAK,
             recovery_break_after_sec=RECOVERY,
         )
 
-    def test_frozen_counter_is_explained_not_silent(self):
-        result = self._returning()
-        self.assertEqual(result.work_label, "Отсчёт приостановлен")
-        self.assertIn("возобновится через 40 с", result.next_threshold_text)
+    def test_counter_runs_immediately(self):
+        result = self._after_break()
+        self.assertEqual(result.work_label, "Непрерывная работа")
+        self.assertEqual(result.work_time_text, "00:12:20")
 
-    def test_work_time_is_kept_not_reset(self):
-        self.assertEqual(self._returning().work_time_text, "00:12:20")
+    def test_no_countdown_before_the_counter_resumes(self):
+        text = self._after_break().next_threshold_text
+        self.assertNotIn("возобновится", text)
 
-    def test_details_explain_the_protective_period(self):
-        titles = [block.title for block in self._returning().details]
-        self.assertIn("Почему счётчики стоят", titles)
+    def test_screen_does_not_explain_frozen_counters(self):
+        titles = [block.title for block in self._after_break().details]
+        self.assertNotIn("Почему счётчики стоят", titles)
 
 
 class ThresholdWordingTests(unittest.TestCase):

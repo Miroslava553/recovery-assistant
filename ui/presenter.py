@@ -325,59 +325,10 @@ def build_main_screen_view(
     vision_available: bool = True,
     break_active: bool = False,
     meaningful_break_sec: float = 180.0,
-    returning_duration_sec: float = 60.0,
     eye_rest_after_sec: float,
     microbreak_after_sec: float,
     recovery_break_after_sec: float,
 ) -> MainScreenView:
-    if assessment.state is UserState.RETURNING:
-        # Защитный период после перерыва: счётчики намеренно стоят. Без
-        # объяснения это выглядит как зависшая программа.
-        seconds_left = max(0, int(returning_duration_sec - getattr(snapshot, "seconds_in_state", 0.0)))
-        return MainScreenView(
-            monitoring=monitoring,
-            monitoring_text="Возвращение к работе",
-            work_label="Отсчёт приостановлен",
-            work_time_text=format_duration(assessment.continuous_work_sec),
-            work_progress=0.0,
-            next_threshold_text=(
-                f"счётчик возобновится через {seconds_left} с"
-                if seconds_left
-                else "счётчик вот-вот возобновится"
-            ),
-            signal_value_text="пауза",
-            signal_percent=None,
-            signal_bars=0,
-            signal_tone="off",
-            signal_hint="оценка возобновится после возвращения к работе",
-            level=int(assessment.workload_level),
-            level_title="Возвращение к работе",
-            reasons=(
-                ReasonRow(
-                    channel="session",
-                    channel_label="контекст",
-                    text="Рабочее состояние ещё не устоялось",
-                    dim=True,
-                ),
-            ),
-            action_title="Возвращайтесь к работе в спокойном темпе",
-            action_text="Оценка возобновится, когда рабочий контекст станет устойчивым.",
-            show_action_buttons=False,
-            updated_text="обновлено " + format_assessment_age(now - assessment.captured_at),
-            details=(
-                DetailBlock(
-                    title="Почему счётчики стоят",
-                    text=(
-                        "Сразу после перерыва действует короткий защитный период. "
-                        "Пока он идёт, программа не начисляет ни рабочее время, ни "
-                        "время перерыва: рабочее поведение ещё не установилось, и "
-                        "любые выводы были бы преждевременными."
-                    ),
-                    dim=True,
-                ),
-            ),
-        )
-
     on_break = break_active or assessment.state in {UserState.BREAK, UserState.AWAY}
     if on_break:
         return _break_view(

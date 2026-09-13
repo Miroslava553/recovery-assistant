@@ -184,15 +184,15 @@ class BreakCounterResetTests(unittest.TestCase):
             engine.update(signals(now, state=state))
         return now
 
-    def test_new_break_after_returning_starts_from_zero(self):
-        """Раньше перерыв, начатый в защитный период, продолжал старый счёт."""
+    def test_new_break_after_an_unclear_stretch_starts_from_zero(self):
+        """Перерыв, начатый из неопределённого состояния, не продолжает старый счёт."""
 
         engine = self._engine()
         now = 100.0
         engine.update(signals(now, state=UserState.ACTIVE_WORK))
         now = self._feed(engine, UserState.ACTIVE_WORK, start=now, seconds=10)
         now = self._feed(engine, UserState.BREAK, start=now, seconds=5)
-        now = self._feed(engine, UserState.RETURNING, start=now, seconds=3)
+        now = self._feed(engine, UserState.UNKNOWN, start=now, seconds=3)
         assessment = engine.update(signals(now + 1.0, state=UserState.BREAK))
         self.assertLessEqual(assessment.current_break_sec, 1.5)
 
@@ -202,7 +202,7 @@ class BreakCounterResetTests(unittest.TestCase):
         engine.update(signals(now, state=UserState.ACTIVE_WORK))
         now = self._feed(engine, UserState.ACTIVE_WORK, start=now, seconds=20)
         now = self._feed(engine, UserState.BREAK, start=now, seconds=35)
-        assessment = engine.update(signals(now + 1.0, state=UserState.RETURNING))
+        assessment = engine.update(signals(now + 1.0, state=UserState.UNKNOWN))
         self.assertEqual(assessment.continuous_work_sec, 0.0)
 
     def test_short_break_does_not_reset_work(self):
@@ -211,7 +211,6 @@ class BreakCounterResetTests(unittest.TestCase):
         engine.update(signals(now, state=UserState.ACTIVE_WORK))
         now = self._feed(engine, UserState.ACTIVE_WORK, start=now, seconds=20)
         now = self._feed(engine, UserState.BREAK, start=now, seconds=5)
-        now = self._feed(engine, UserState.RETURNING, start=now, seconds=3)
         assessment = engine.update(signals(now + 1.0, state=UserState.ACTIVE_WORK))
         self.assertGreater(assessment.continuous_work_sec, 15.0)
 

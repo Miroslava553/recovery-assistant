@@ -68,16 +68,17 @@ class RecoveryAssistantApp:
             min_observation_sec=50.0,
             target_relevant_keys=25,
         )
-        # В демо-режиме защитный период после перерыва тоже ускорен, иначе
-        # проверка интерфейса упирается в минуту неподвижных счётчиков.
-        self.returning_duration_sec = 6.0 if self.demo_mode else 60.0
+        # Разогрев после перерыва не останавливает счётчики: он только
+        # запрещает складывать первые секунды печати в личную норму.
+        # В демо-режиме он короче, чтобы не ждать минуту при проверке.
+        self.baseline_warmup_sec = 6.0 if self.demo_mode else 60.0
         self.monitor = SessionMonitor(
             typing_baseline_service=self.typing_baseline,
             target_visual_fps=20.0,
             include_diagnostic_frame=False,
             vision_required=False,
             state_manager=UserStateManager(
-                returning_duration_sec=self.returning_duration_sec
+                baseline_warmup_sec=self.baseline_warmup_sec
             ),
         )
         self.store = RecoveryEventStore(DATABASE_PATH, profile_id=self.profile_id)
@@ -187,7 +188,6 @@ class RecoveryAssistantApp:
             vision_available=self.monitor.vision_available,
             break_active=self._manual_break,
             meaningful_break_sec=self.engine.meaningful_break_sec,
-            returning_duration_sec=self.returning_duration_sec,
             eye_rest_after_sec=self.engine.eye_rest_after_sec,
             microbreak_after_sec=self.engine.microbreak_after_sec,
             recovery_break_after_sec=self.engine.recovery_break_after_sec,

@@ -459,10 +459,10 @@ class AdaptiveRecoveryEngine:
                 self._current_recommendation = None
             return
 
-        # RETURNING и UNKNOWN: перерыв уже закончился, работа ещё не началась.
-        # Раньше счётчик перерыва обнулялся только при возобновлении работы,
-        # поэтому новый перерыв, начатый в защитный период, продолжал старое
-        # значение. Итог перерыва подводим здесь же, а не откладываем.
+        # UNKNOWN: перерыв уже закончился, но работа ещё не подтверждена.
+        # Счётчик перерыва обнуляется здесь, а не при возобновлении работы:
+        # иначе новый перерыв, начатый из неопределённого состояния,
+        # продолжал бы старое значение.
         if self._current_break_sec > 0.0:
             if self._current_break_sec >= self.meaningful_break_sec:
                 self._continuous_work_sec = 0.0
@@ -690,7 +690,7 @@ class AdaptiveRecoveryEngine:
         target: WorkloadLevel,
         urgent: bool,
     ) -> WorkloadLevel:
-        if signals.state in {UserState.UNKNOWN, UserState.RETURNING}:
+        if signals.state is UserState.UNKNOWN:
             self._pending_workload_level = None
             self._pending_workload_count = 0
             return self._stable_workload_level
@@ -818,7 +818,7 @@ class AdaptiveRecoveryEngine:
         signals: RecoverySignals,
         now: float,
     ) -> tuple[AssessmentReliability, str]:
-        if signals.state in {UserState.UNKNOWN, UserState.RETURNING}:
+        if signals.state is UserState.UNKNOWN:
             return (
                 AssessmentReliability.LIMITED,
                 "Рабочий контекст пока недостаточно стабилен для уверенной интерпретации.",
@@ -895,8 +895,6 @@ class AdaptiveRecoveryEngine:
     ) -> str:
         if signals.state in {UserState.AWAY, UserState.BREAK}:
             return "Перерыв"
-        if signals.state is UserState.RETURNING:
-            return "Возвращение к работе"
         if signals.state is UserState.UNKNOWN:
             return "Оценка временно ограничена"
         if recommendation is not None:

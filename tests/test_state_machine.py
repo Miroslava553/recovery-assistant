@@ -13,7 +13,7 @@ class UserStateManagerTests(unittest.TestCase):
             active_input_threshold_sec=2.0,
             away_input_threshold_sec=5.0,
             away_face_threshold_sec=5.0,
-            returning_duration_sec=4.0,
+            baseline_warmup_sec=4.0,
             transition_debounce_sec=1.0,
         )
         manager.reset(now=0.0)
@@ -69,21 +69,56 @@ class UserStateManagerTests(unittest.TestCase):
         self.assertEqual(decision.state, UserState.AWAY)
         self.assertFalse(decision.fatigue_analysis_allowed)
 
-    def test_return_from_away_enters_returning(self):
-        manager = self.make_manager()
-        away_signals = PresenceSignals(False, 20.0, None, 0.80)
+    def _returned_from_away(self, manager, *, at: float = 7.0):
+        """Довести автомат до AWAY и вернуть человека к работе."""
 
+        away_signals = PresenceSignals(False, 20.0, None, 0.80)
         manager.update(away_signals, now=0.0)
         manager.update(away_signals, now=5.1)
         manager.update(away_signals, now=6.2)
+        return manager.update(PresenceSignals(True, 0.1, True, 0.95), now=at)
 
-        decision = manager.update(
-            PresenceSignals(True, 0.1, True, 0.95),
-            now=7.0,
+    def test_return_from_away_resumes_work_immediately(self):
+        """Раньше здесь был защитный период, и счётчик сессии стоял минуту."""
+
+        manager = self.make_manager()
+        decision = self._returned_from_away(manager)
+
+        self.assertEqual(decision.state, UserState.ACTIVE_WORK)
+        self.assertTrue(decision.fatigue_analysis_allowed)
+
+    def test_personal_norm_is_not_updated_right_after_returning(self):
+        """Первые секунды после перерыва не типичны: человек разгоняется."""
+
+        manager = self.make_manager()
+        decision = self._returned_from_away(manager)
+
+        self.assertTrue(decision.baseline_warmup)
+        self.assertFalse(decision.baseline_update_allowed)
+
+    def test_personal_norm_resumes_after_the_warmup(self):
+        manager = self.make_manager()
+        self._returned_from_away(manager)
+
+        working = PresenceSignals(True, 0.1, True, 0.95)
+        decision = manager.update(working, now=7.0 + 4.0)
+
+        self.assertFalse(decision.baseline_warmup)
+        self.assertTrue(decision.baseline_update_allowed)
+
+    def test_zero_warmup_disables_the_guard(self):
+        manager = UserStateManager(
+            active_input_threshold_sec=2.0,
+            away_input_threshold_sec=5.0,
+            away_face_threshold_sec=5.0,
+            baseline_warmup_sec=0.0,
+            transition_debounce_sec=1.0,
         )
+        manager.reset(now=0.0)
+        decision = self._returned_from_away(manager)
 
-        self.assertEqual(decision.state, UserState.RETURNING)
-        self.assertFalse(decision.fatigue_analysis_allowed)
+        self.assertFalse(decision.baseline_warmup)
+        self.assertTrue(decision.baseline_update_allowed)
 
     def test_manual_break_is_immediate(self):
         manager = self.make_manager()

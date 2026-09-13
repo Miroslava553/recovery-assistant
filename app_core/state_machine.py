@@ -18,7 +18,6 @@ class UserState(StrEnum):
     PASSIVE_WORK = "passive_work"
     AWAY = "away"
     BREAK = "break"
-    RETURNING = "returning"
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,6 +48,7 @@ class StateDecision:
     fatigue_analysis_allowed: bool
     baseline_update_allowed: bool
     seconds_in_state: float
+    baseline_warmup: bool = False
 
 
 class UserStateManager:
@@ -61,7 +61,23 @@ class UserStateManager:
       визуальный канал временно недоступен;
     - AWAY требует одновременно долгого отсутствия лица и долгого
       отсутствия ввода;
-    - после возвращения действует защитный период RETURNING.
+    - после возвращения человек сразу считается работающим, но первые
+      секунды не идут в личную норму печати.
+
+    Про последний пункт стоит сказать отдельно. Раньше здесь было
+    отдельное состояние RETURNING: после перерыва человек на минуту
+    попадал в «защитный период», где стояли все счётчики. Это смешивало
+    две разные вещи. Работает человек или нет — это факт о человеке, и
+    сразу после перерыва ответ «работает». А вот годятся ли первые
+    секунды после перерыва для калибровки личной нормы — это факт о
+    качестве данных: пока человек разгоняется, его ритм печати не
+    типичен, и складывать его в норму нельзя, иначе норма поедет в
+    сторону «медленно и с паузами», а настоящее замедление от усталости
+    потом будет выглядеть нормой.
+
+    Поэтому состояние теперь честное (ACTIVE_WORK или PASSIVE_WORK), а
+    осторожность выражена отдельным флагом `baseline_update_allowed`.
+    Длительность разогрева — `baseline_warmup_sec`; ноль отключает его.
     """
 
     def __init__(
@@ -70,7 +86,7 @@ class UserStateManager:
         active_input_threshold_sec: float = 8.0,
         away_input_threshold_sec: float = 20.0,
         away_face_threshold_sec: float = 12.0,
-        returning_duration_sec: float = 60.0,
+        baseline_warmup_sec: float = 60.0,
         low_quality_threshold: float = 0.45,
         transition_debounce_sec: float = 2.0,
     ) -> None:
@@ -78,7 +94,7 @@ class UserStateManager:
             "active_input_threshold_sec": active_input_threshold_sec,
             "away_input_threshold_sec": away_input_threshold_sec,
             "away_face_threshold_sec": away_face_threshold_sec,
-            "returning_duration_sec": returning_duration_sec,
+            "baseline_warmup_sec": baseline_warmup_sec,
             "transition_debounce_sec": transition_debounce_sec,
         }
 
@@ -100,7 +116,7 @@ class UserStateManager:
         self.active_input_threshold_sec = float(active_input_threshold_sec)
         self.away_input_threshold_sec = float(away_input_threshold_sec)
         self.away_face_threshold_sec = float(away_face_threshold_sec)
-        self.returning_duration_sec = float(returning_duration_sec)
+        self.baseline_warmup_sec = float(baseline_warmup_sec)
         self.low_quality_threshold = float(low_quality_threshold)
         self.transition_debounce_sec = float(transition_debounce_sec)
 
@@ -110,7 +126,7 @@ class UserStateManager:
         self._candidate_state: UserState | None = None
         self._candidate_since: float | None = None
         self._face_missing_since: float | None = None
-        self._returning_until: float | None = None
+        self._baseline_warmup_until: float | None = None
 
     @property
     def state(self) -> UserState:
@@ -123,7 +139,7 @@ class UserStateManager:
         self._candidate_state = None
         self._candidate_since = None
         self._face_missing_since = None
-        self._returning_until = None
+        self._baseline_warmup_until = None
 
     def update(
         self,
@@ -148,22 +164,12 @@ class UserStateManager:
             previous_state in {UserState.AWAY, UserState.BREAK}
             and target_state in {UserState.ACTIVE_WORK, UserState.PASSIVE_WORK}
         ):
-            self._returning_until = current_time + self.returning_duration_sec
-            self._commit_state(UserState.RETURNING, current_time)
-            reason = (
-                "Пользователь вернулся. Идёт защитный период повторной "
-                "калибровки."
-            )
-        elif self._state is UserState.RETURNING:
-            if (
-                self._returning_until is not None
-                and current_time < self._returning_until
-            ):
-                target_state = UserState.RETURNING
-                reason = "Идёт защитный период после возвращения."
-            else:
-                self._returning_until = None
-                self._apply_debounced_state(target_state, current_time)
+            # Возвращение засчитывается сразу, без выдержки: человек уже
+            # работает, и счётчик рабочей сессии должен идти. Осторожность
+            # касается только калибровки личной нормы.
+            self._baseline_warmup_until = current_time + self.baseline_warmup_sec
+            self._commit_state(target_state, current_time)
+            reason = "Пользователь вернулся к работе."
         else:
             self._apply_debounced_state(target_state, current_time)
 
@@ -174,11 +180,14 @@ class UserStateManager:
             UserState.PASSIVE_WORK,
         }
 
+        warmup = self._in_baseline_warmup(current_time)
+
         # Этот общий флаг относится только к визуально подтверждённым
         # окнам. Клавиатурный baseline проверяет качество своего канала
         # отдельно и не зависит от качества камеры.
         baseline_allowed = (
             fatigue_allowed
+            and not warmup
             and signals.face_detected is True
             and signals.data_quality >= 0.80
             and not signals.screen_locked
@@ -193,7 +202,22 @@ class UserStateManager:
             fatigue_analysis_allowed=fatigue_allowed,
             baseline_update_allowed=baseline_allowed,
             seconds_in_state=max(0.0, current_time - self._state_since),
+            baseline_warmup=warmup,
         )
+
+    def _in_baseline_warmup(self, current_time: float) -> bool:
+        """Идёт ли разогрев после возвращения к работе.
+
+        Флаг снимается сам по времени. Отдельно сбрасывать его при уходе
+        на перерыв не нужно: следующее возвращение выставит новый срок.
+        """
+
+        if self._baseline_warmup_until is None:
+            return False
+        if current_time >= self._baseline_warmup_until:
+            self._baseline_warmup_until = None
+            return False
+        return True
 
     def _classify(
         self,

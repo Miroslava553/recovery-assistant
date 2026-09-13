@@ -7,12 +7,14 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 
 import tkinter as tk
 
 import customtkinter as ctk
 
 from ui import theme
+from ui.formatting import wrap_width
 from ui.view_model import MainScreenView
 
 
@@ -61,6 +63,22 @@ class Pill(ctk.CTkLabel):
             padx=10,
             pady=3,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class _WrappedLabel:
+    """Метка, ширину переноса которой считаем по фактической разметке.
+
+    `container` — виджет, чья ширина и есть доступное место. `neighbours` —
+    то, что стоит на той же строке слева или справа и это место отнимает
+    (например плашка канала перед текстом основания). `gap` — отступ между
+    меткой и соседями.
+    """
+
+    label: ctk.CTkLabel
+    container: ctk.CTkBaseClass
+    neighbours: tuple[ctk.CTkBaseClass, ...] = ()
+    gap: int = 0
 
 
 class Card(ctk.CTkFrame):
@@ -113,12 +131,16 @@ class MainScreen(ctk.CTkFrame):
         self._detail_cards: list[tuple[Card, ctk.CTkLabel, ctk.CTkLabel]] = []
 
         # Метки, у которых ширину переноса надо пересчитывать при изменении
-        # размера окна. Пара (виджет, доля от ширины содержимого).
-        self._wrapping: list[tuple[ctk.CTkLabel, float]] = []
+        # размера окна. Для каждой хранится контейнер, по которому меряется
+        # доступная ширина, и соседи, занимающие часть той же строки.
+        self._wrapping: list[_WrappedLabel] = []
+        self._wrap_widths: dict[int, int] = {}
+        self._wrap_pending = False
 
         self.max_content_width = max_content_width
         self._side_padding = 20
         self._last_content_width = 0
+        self._last_inner_width = 0
 
         # Прокручиваемая область: при раскрытом «Подробнее» содержимое не
         # помещается в окно, и без прокрутки нижние карточки становятся
@@ -139,18 +161,16 @@ class MainScreen(ctk.CTkFrame):
         self._build_details(self.outer, on_technical, on_camera)
 
         self.bind("<Configure>", self._on_resize)
+        self.outer.bind("<Configure>", self._on_content_resize)
 
     # ------------------------------------------------------------------ шапка
     def _build_header(self, parent, on_self_report, on_monitoring_click=None) -> None:
         row = ctk.CTkFrame(parent, fg_color="transparent")
         row.pack(fill="x", pady=(0, 16))
 
-        ctk.CTkLabel(
-            row,
-            text="Ассистент восстановления",
-            font=_font(13),
-            text_color=theme.TEXT_SECONDARY,
-        ).pack(side="left")
+        # Название программы здесь не повторяем: оно уже стоит в заголовке
+        # окна. Раньше строка была занята им, и трём элементам не хватало
+        # места — «Как я себя чувствую» сплющивалось в полоску.
 
         # Плашка кликабельна: по ней открывается диагностическое превью
         # камеры. Отдельной кнопки для этого нет — статус камеры и её
@@ -181,7 +201,7 @@ class MainScreen(ctk.CTkFrame):
                 corner_radius=theme.RADIUS_BUTTON,
                 height=28,
                 command=on_self_report,
-            ).pack(side="right", padx=(0, 10))
+            ).pack(side="left")
 
     # ------------------------------------------------- таймер и сигнал камеры
     def _build_top_cards(self, parent) -> None:
@@ -228,11 +248,12 @@ class MainScreen(ctk.CTkFrame):
             text="",
             font=_font(11),
             text_color=theme.TEXT_DIM,
-            wraplength=260,
+            wraplength=120,
+            anchor="w",
             justify="left",
         )
-        self.next_threshold_label.pack(anchor="w", pady=(5, 0))
-        self._wrapping.append((self.next_threshold_label, 0.40))
+        self.next_threshold_label.pack(fill="x", pady=(5, 0))
+        self._wrapping.append(_WrappedLabel(self.next_threshold_label, inner))
 
         # --- сигнал камеры
         signal = Card(row)
@@ -263,11 +284,12 @@ class MainScreen(ctk.CTkFrame):
             text="",
             font=_font(11),
             text_color=theme.TEXT_DIM,
-            wraplength=260,
+            wraplength=120,
+            anchor="w",
             justify="left",
         )
-        self.signal_hint_label.pack(anchor="w", pady=(5, 0))
-        self._wrapping.append((self.signal_hint_label, 0.44))
+        self.signal_hint_label.pack(fill="x", pady=(5, 0))
+        self._wrapping.append(_WrappedLabel(self.signal_hint_label, inner))
 
     # --------------------------------------------------- встроенная камера
     def _build_camera_panel(self, parent) -> None:
@@ -369,11 +391,12 @@ class MainScreen(ctk.CTkFrame):
             text="",
             font=_font(21),
             text_color=theme.LEVEL_COLORS[1]["title"],
-            wraplength=520,
+            wraplength=120,
+            anchor="w",
             justify="left",
         )
-        self.level_title.pack(anchor="w", pady=(6, 11))
-        self._wrapping.append((self.level_title, 0.92))
+        self.level_title.pack(fill="x", pady=(6, 11))
+        self._wrapping.append(_WrappedLabel(self.level_title, inner))
 
         self.level_bar = SegmentedBar(inner, segments=5, height=7)
         self.level_bar.pack(fill="x")
@@ -403,11 +426,14 @@ class MainScreen(ctk.CTkFrame):
                 text="",
                 font=_font(13),
                 text_color=theme.TEXT_SECONDARY,
-                wraplength=430,
+                wraplength=120,
+                anchor="w",
                 justify="left",
             )
-            text.pack(side="left", padx=(9, 0))
-            self._wrapping.append((text, 0.78))
+            text.pack(side="left", fill="x", expand=True, padx=(9, 0))
+            # Плашка канала занимает часть строки, и занимает по-разному:
+            # «сессия» и «самооценка» заметно разной ширины.
+            self._wrapping.append(_WrappedLabel(text, row, (pill,), gap=9))
             self._reason_rows.append((row, pill, text))
 
     # ------------------------------------------------------------ действие
@@ -429,22 +455,24 @@ class MainScreen(ctk.CTkFrame):
             text="",
             font=_font(17),
             text_color=theme.ACTION_TITLE,
-            wraplength=520,
+            wraplength=120,
+            anchor="w",
             justify="left",
         )
-        self.action_title.pack(anchor="w", pady=(6, 0))
-        self._wrapping.append((self.action_title, 0.92))
+        self.action_title.pack(fill="x", pady=(6, 0))
+        self._wrapping.append(_WrappedLabel(self.action_title, inner))
 
         self.action_text = ctk.CTkLabel(
             inner,
             text="",
             font=_font(13),
             text_color=theme.ACTION_LABEL,
-            wraplength=520,
+            wraplength=120,
+            anchor="w",
             justify="left",
         )
-        self.action_text.pack(anchor="w", pady=(6, 0))
-        self._wrapping.append((self.action_text, 0.92))
+        self.action_text.pack(fill="x", pady=(6, 0))
+        self._wrapping.append(_WrappedLabel(self.action_text, inner))
 
         self.action_buttons = ctk.CTkFrame(inner, fg_color="transparent")
         self.action_buttons.pack(anchor="w", pady=(12, 0))
@@ -550,11 +578,12 @@ class MainScreen(ctk.CTkFrame):
                 text="",
                 font=_font(14),
                 text_color=theme.TEXT_SECONDARY,
-                wraplength=520,
+                wraplength=120,
+                anchor="w",
                 justify="left",
             )
-            body.pack(anchor="w", pady=(5, 0))
-            self._wrapping.append((body, 0.90))
+            body.pack(fill="x", pady=(5, 0))
+            self._wrapping.append(_WrappedLabel(body, inner))
             self._detail_cards.append((card, title, body))
 
         buttons = ctk.CTkFrame(self.details_panel, fg_color="transparent")
@@ -610,14 +639,68 @@ class MainScreen(ctk.CTkFrame):
         self._last_content_width = content
 
         self.outer.pack_configure(padx=padding)
+        self._schedule_wrapping()
 
-        # CustomTkinter умножает wraplength на масштаб экрана Windows. Если
-        # передать ширину в реальных пикселях, на экране со 150% перенос
-        # окажется в полтора раза шире карточки, и текст просто обрежется.
-        # Поэтому делим заранее.
+    def _on_content_resize(self, event) -> None:
+        """Ширина содержимого меняется не только вместе с окном.
+
+        Полоса прокрутки появляется и исчезает сама, и внутренняя ширина
+        меняется без изменения размера окна. Поэтому слушаем и её.
+        """
+
+        if abs(event.width - self._last_inner_width) < 2:
+            return
+        self._last_inner_width = event.width
+        self._schedule_wrapping()
+
+    def _schedule_wrapping(self) -> None:
+        """Отложить пересчёт до конца текущей раскладки.
+
+        Ширину надо спрашивать у tkinter уже после того, как он разложил
+        виджеты. Если спросить сразу, вернутся прошлые значения — заметно,
+        например, когда плашка канала сменилась с «сессия» на «самооценка».
+        """
+
+        if self._wrap_pending:
+            return
+        self._wrap_pending = True
+        try:
+            self.after_idle(self._apply_wrapping)
+        except Exception:
+            self._wrap_pending = False
+
+    def _apply_wrapping(self) -> None:
+        """Ширина переноса берётся из разметки, а не из подобранных долей.
+
+        Раньше здесь были доли от ширины окна: 0.40 для карточки таймера,
+        0.78 для строки основания и так далее. Каждая доля — догадка о
+        геометрии, и каждая ошибалась по-своему: в них не входили полоса
+        прокрутки, зазор между верхними карточками и ширина плашки канала.
+        Догадка получалась шире места, текст оставался одной строкой и
+        обрезался с обеих сторон сразу — внутри метки он выровнен по
+        центру, поэтому лишнее срезалось симметрично.
+
+        Теперь ширину сообщает сам tkinter: он уже разложил карточки и
+        знает точные числа. Доли не нужны.
+        """
+
+        self._wrap_pending = False
         scaling = self._widget_scaling()
-        for label, share in self._wrapping:
-            label.configure(wraplength=max(120, int(content * share / scaling)))
+
+        for item in self._wrapping:
+            wrap = wrap_width(
+                item.container.winfo_width(),
+                occupied=tuple(n.winfo_width() for n in item.neighbours),
+                gap=item.gap,
+                limit=self._last_content_width,
+                scaling=scaling,
+            )
+            if wrap is None:
+                continue  # разметка ещё не построена
+            if self._wrap_widths.get(id(item.label)) == wrap:
+                continue
+            self._wrap_widths[id(item.label)] = wrap
+            item.label.configure(wraplength=wrap)
 
     @staticmethod
     def _widget_scaling() -> float:
@@ -682,6 +765,10 @@ class MainScreen(ctk.CTkFrame):
         self._render_action(view)
         self._render_details(view)
         self.updated_label.configure(text=view.updated_text)
+
+        # Новые тексты меняют ширину плашек каналов, а значит и место,
+        # оставшееся строке основания.
+        self._schedule_wrapping()
 
     def _render_reasons(self, view: MainScreenView) -> None:
         for index, (row, pill, text) in enumerate(self._reason_rows):

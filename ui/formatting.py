@@ -66,17 +66,52 @@ def user_facing_summary(
             "Восстановительный интервал идёт",
             "Рабочая нагрузка в этот период не накапливается.",
         )
-    if assessment.state is UserState.RETURNING:
-        return (
-            "Оценка возобновляется",
-            "После возвращения система ждёт стабилизации рабочего контекста.",
-        )
     if assessment.state is UserState.UNKNOWN:
         return (
             "Оценка временно ограничена",
             "Рабочий контекст пока недостаточно определён для устойчивого вывода.",
         )
     return assessment.workload_title, assessment.workload_summary
+
+
+def wrap_width(
+    container_width: int,
+    *,
+    occupied: tuple[int, ...] = (),
+    gap: int = 0,
+    limit: int = 0,
+    scaling: float = 1.0,
+    margin: int = 2,
+    minimum: int = 80,
+) -> int | None:
+    """Ширина переноса строки для метки внутри контейнера.
+
+    Возвращает `None`, если считать пока не по чему: до первой раскладки
+    tkinter сообщает о ширине единицу, и такое значение надо пропустить,
+    а не превращать в перенос по одному символу.
+
+    `occupied` — ширины соседей на той же строке (плашка канала перед
+    текстом), `gap` — отступ до каждого из них. `limit` ограничивает
+    результат шириной колонки содержимого: она задаётся окном и не
+    зависит от текста, поэтому исключает обратную связь, когда широкий
+    текст растягивает карточку, а карточка разрешает ещё более широкий
+    текст.
+
+    `scaling` — масштаб экрана. CustomTkinter сам умножает на него
+    wraplength, поэтому значение возвращается в его единицах: иначе на
+    экране со 150% перенос оказался бы в полтора раза шире карточки.
+    """
+
+    if container_width <= 1:
+        return None
+
+    available = container_width
+    for width in occupied:
+        available -= width + gap
+    if limit > 0:
+        available = min(available, limit)
+
+    return max(minimum, int((available - margin) / max(0.1, scaling)))
 
 
 def format_assessment_age(seconds: float) -> str:
@@ -132,11 +167,6 @@ def recommended_action(assessment: RecoveryAssessment) -> tuple[str, str]:
         return (
             "Продолжайте текущий перерыв",
             f"Текущая продолжительность: {format_duration(assessment.current_break_sec)}.",
-        )
-    if assessment.state is UserState.RETURNING:
-        return (
-            "Возвращайтесь к работе в спокойном темпе",
-            "Оценка возобновится после стабилизации рабочего контекста.",
         )
     if assessment.state is UserState.UNKNOWN:
         return (

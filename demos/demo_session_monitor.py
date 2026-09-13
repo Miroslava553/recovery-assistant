@@ -11,7 +11,6 @@ STATE_TEXT: dict[UserState, str] = {
     UserState.PASSIVE_WORK: "PASSIVE WORK",
     UserState.AWAY: "AWAY",
     UserState.BREAK: "BREAK",
-    UserState.RETURNING: "RETURNING",
 }
 
 STATE_COLORS: dict[UserState, tuple[int, int, int]] = {
@@ -20,7 +19,6 @@ STATE_COLORS: dict[UserState, tuple[int, int, int]] = {
     UserState.PASSIVE_WORK: (0, 210, 210),
     UserState.AWAY: (150, 150, 150),
     UserState.BREAK: (255, 160, 0),
-    UserState.RETURNING: (255, 210, 0),
 }
 
 

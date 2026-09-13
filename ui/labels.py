@@ -21,7 +21,6 @@ STATE_USER_LABELS: dict[UserState, str] = {
     UserState.PASSIVE_WORK: "Чтение или просмотр",
     UserState.AWAY: "Пользователь отошёл",
     UserState.BREAK: "Перерыв",
-    UserState.RETURNING: "Возвращение к работе",
 }
 
 FATIGUE_SP_LABELS: dict[int, tuple[str, str]] = {

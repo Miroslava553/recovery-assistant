@@ -14,7 +14,7 @@ manager = UserStateManager(
     transition_debounce_sec=1.0,
     away_face_threshold_sec=5.0,
     away_input_threshold_sec=5.0,
-    returning_duration_sec=4.0,
+    baseline_warmup_sec=4.0,
 )
 manager.reset(now=0.0)
 
@@ -59,7 +59,8 @@ show(
     PresenceSignals(False, 26.0, None, 0.80),
 )
 
-# Пользователь вернулся: включается RETURNING.
+# Пользователь вернулся: работа засчитывается сразу, идёт только
+# разогрев личной нормы печати.
 show(
     12.0,
     manager,

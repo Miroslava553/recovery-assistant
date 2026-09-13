@@ -26,7 +26,6 @@ STATE_LABELS: dict[UserState, str] = {
     UserState.PASSIVE_WORK: "Чтение или просмотр",
     UserState.AWAY: "Пользователь отошёл",
     UserState.BREAK: "Перерыв",
-    UserState.RETURNING: "Возвращение к работе",
 }
 
 CAMERA_STATUS_LABELS: dict[str, str] = {
@@ -185,7 +184,7 @@ class SessionMonitor:
             active_input_threshold_sec=8.0,
             away_input_threshold_sec=20.0,
             away_face_threshold_sec=12.0,
-            returning_duration_sec=60.0,
+            baseline_warmup_sec=60.0,
             low_quality_threshold=0.45,
             transition_debounce_sec=2.0,
         )
