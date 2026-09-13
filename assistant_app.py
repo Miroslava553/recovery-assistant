@@ -31,9 +31,11 @@ from app_core.state_machine import UserState
 from app_core.storage import AppDatabase
 from app_core.typing_baseline import TypingBaselineService
 from ui.formatting import (
+    format_assessment_age,
     format_duration,
     format_optional,
     neighbor_description,
+    recommended_action,
     self_report_description,
     user_facing_summary,
 )
@@ -193,13 +195,23 @@ class RecoveryAssistantApp:
             wraplength=840,
         ).pack(anchor="w")
 
+        self.session_context_var = tk.StringVar(
+            value="Непрерывная работа: 00:00   ·   Оценка обновлена: сейчас"
+        )
+        ttk.Label(
+            card,
+            textvariable=self.session_context_var,
+            style="Small.TLabel",
+            foreground="#333333",
+        ).pack(anchor="w", pady=(7, 0))
+
         self.reliability_var = tk.StringVar(value="Оценка ограничена")
         ttk.Label(
             card,
             textvariable=self.reliability_var,
             style="Small.TLabel",
             foreground="#555555",
-        ).pack(anchor="w", pady=(7, 0))
+        ).pack(anchor="w", pady=(2, 0))
 
     def _build_reason_card(self, parent: ttk.Frame) -> None:
         card = ttk.LabelFrame(parent, text="2. ОСНОВАНИЕ", padding=14)
@@ -397,6 +409,12 @@ class RecoveryAssistantApp:
         title, detail = user_facing_summary(assessment, demo_mode=self.demo_mode)
         self.hero_title_var.set(title)
         self.hero_text_var.set(detail)
+        self.session_context_var.set(
+            "Непрерывная работа: "
+            + format_duration(assessment.continuous_work_sec)
+            + "   ·   Оценка обновлена: "
+            + format_assessment_age(time.monotonic() - assessment.captured_at)
+        )
         self.reliability_var.set(assessment.reliability_label)
 
         reasons = list(assessment.primary_reasons)
@@ -428,21 +446,9 @@ class RecoveryAssistantApp:
             self.snooze_button.configure(state="disabled")
             self.irrelevant_button.configure(state="disabled")
 
-            if assessment.state in {UserState.AWAY, UserState.BREAK}:
-                self.action_title_var.set("Продолжайте текущий перерыв")
-                self.action_text_var.set(
-                    f"Текущая продолжительность: {format_duration(assessment.current_break_sec)}."
-                )
-            elif assessment.workload_level is WorkloadLevel.EARLY:
-                self.action_title_var.set("Пока достаточно наблюдения")
-                self.action_text_var.set(
-                    "Ранний сигнал ещё не требует отдельного восстановительного действия."
-                )
-            else:
-                self.action_title_var.set("Продолжайте работу в обычном режиме")
-                self.action_text_var.set(
-                    "Активная восстановительная рекомендация сейчас не требуется."
-                )
+            title, text = recommended_action(assessment)
+            self.action_title_var.set(title)
+            self.action_text_var.set(text)
             return
 
         self.snooze_button.configure(state="normal")

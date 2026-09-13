@@ -13,7 +13,9 @@ from app_core.state_machine import UserState
 from assistant_app import (
     FATIGUE_SP_LABELS,
     SLEEPINESS_KSS_LABELS,
+    format_assessment_age,
     neighbor_description,
+    recommended_action,
     self_report_description,
     user_facing_summary,
 )
@@ -74,6 +76,73 @@ class UserFacingSummaryTests(unittest.TestCase):
             for short, detail in labels.values():
                 self.assertGreaterEqual(len(short), 5)
                 self.assertGreaterEqual(len(detail), 20)
+
+
+class RecommendedActionTests(unittest.TestCase):
+    """Совет на главном экране следует уровню, а не наличию уведомления."""
+
+    def _assessment(
+        self,
+        *,
+        state: UserState = UserState.ACTIVE_WORK,
+        level: WorkloadLevel = WorkloadLevel.STABLE,
+    ) -> RecoveryAssessment:
+        return RecoveryAssessment(
+            captured_at=time.monotonic(),
+            state=state,
+            status_label="",
+            continuous_work_sec=0.0,
+            current_break_sec=0.0,
+            typing_calibration_progress=0.0,
+            evidence=(),
+            recommendation=None,
+            recommendation_is_new=False,
+            decision_basis="",
+            ocular_used_for_decision=False,
+            workload_level=level,
+            workload_title=WORKLOAD_TITLES[level],
+            workload_summary=WORKLOAD_SUMMARIES[level],
+        )
+
+    def test_expressed_level_never_advises_business_as_usual(self):
+        """Главная исправленная ошибка: cooldown не меняет смысл совета."""
+
+        for level in (WorkloadLevel.EXPRESSED, WorkloadLevel.RECOVERY_PRIORITY):
+            with self.subTest(level=level):
+                title, text = recommended_action(self._assessment(level=level))
+                self.assertNotIn("обычном режиме", title)
+                self.assertNotIn("обычном режиме", text)
+
+    def test_every_level_has_its_own_action(self):
+        titles = {
+            recommended_action(self._assessment(level=level))[0]
+            for level in WorkloadLevel
+        }
+        self.assertEqual(len(titles), len(WorkloadLevel))
+
+    def test_stable_level_allows_normal_work(self):
+        title, _ = recommended_action(self._assessment(level=WorkloadLevel.STABLE))
+        self.assertIn("обычном режиме", title)
+
+    def test_break_state_overrides_level(self):
+        title, _ = recommended_action(
+            self._assessment(state=UserState.BREAK, level=WorkloadLevel.EXPRESSED)
+        )
+        self.assertIn("перерыв", title.lower())
+
+
+class AssessmentAgeTests(unittest.TestCase):
+    def test_fresh_assessment_reads_as_now(self):
+        self.assertEqual(format_assessment_age(0.0), "сейчас")
+        self.assertEqual(format_assessment_age(4.9), "сейчас")
+
+    def test_seconds_minutes_and_hours(self):
+        self.assertEqual(format_assessment_age(30.0), "30 с назад")
+        self.assertEqual(format_assessment_age(120.0), "2 мин назад")
+        self.assertEqual(format_assessment_age(3720.0), "1 ч 02 мин назад")
+
+    def test_negative_age_is_clamped(self):
+        self.assertEqual(format_assessment_age(-5.0), "сейчас")
 
 
 if __name__ == "__main__":
