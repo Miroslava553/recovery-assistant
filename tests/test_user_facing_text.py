@@ -10,15 +10,14 @@ from app_core.recovery_engine import (
     WORKLOAD_TITLES,
 )
 from app_core.state_machine import UserState
-from assistant_app import (
-    FATIGUE_SP_LABELS,
-    SLEEPINESS_KSS_LABELS,
+from ui.formatting import (
     format_assessment_age,
     neighbor_description,
     recommended_action,
     self_report_description,
     user_facing_summary,
 )
+from ui.labels import FATIGUE_SP_LABELS, SLEEPINESS_KSS_LABELS
 
 
 class UserFacingSummaryTests(unittest.TestCase):

@@ -7,7 +7,8 @@
 Камера, клавиатура и база данных не используются. Скрипт нужен, чтобы
 крутить внешний вид быстро и не трогать рабочую программу: снизу есть
 переключатель сценариев, показывающий все пять уровней нагрузки и разные
-состояния камеры.
+состояния камеры, а также кнопки для проверки двух отдельных окон —
+самооценки и уведомления о рекомендации.
 
 Требуется:
 
@@ -20,6 +21,8 @@ import customtkinter as ctk
 
 from ui import theme
 from ui.main_screen import MainScreen
+from ui.self_report import SelfReportDialog
+from ui.toast import RecommendationToast
 from ui.view_model import DetailBlock, MainScreenView, ReasonRow
 
 SCENARIOS: dict[str, MainScreenView] = {
@@ -295,12 +298,74 @@ def main() -> None:
         on_start_break=lambda: print("нажато: начать перерыв"),
         on_snooze=lambda: print("нажато: отложить"),
         on_dismiss=lambda: print("нажато: неуместно"),
-        on_self_report=lambda: print("нажато: самооценка"),
+        on_self_report=lambda: open_self_report(),
         on_technical=lambda: print("нажато: технические показатели"),
         on_monitoring_click=screen_camera_toggle,
     )
     holder["screen"] = screen
     screen.pack(fill="both", expand=True, padx=10, pady=(10, 0))
+
+    # Просмотр интерфейса работает на выдуманных данных: сенсоров нет, и
+    # кадру взяться неоткуда. Без подписи пустой квадрат читается как
+    # сломанная камера.
+    screen.set_camera_placeholder(
+        "в просмотре интерфейса камера не подключена\n"
+        "здесь будет изображение с вашей камеры"
+    )
+
+    def open_self_report() -> None:
+        SelfReportDialog(
+            root,
+            initial_fatigue=None,
+            initial_sleepiness=None,
+            on_save=lambda f, s: print(f"самооценка сохранена: SP={f}, KSS={s}"),
+        )
+
+    def open_toast(demo: bool) -> None:
+        RecommendationToast(
+            root,
+            title="Пора сделать перерыв",
+            message=(
+                "Работа идёт без остановки больше полутора часов, и ритм печати "
+                "заметно изменился относительно вашей обычной нормы."
+            ),
+            duration_text="00:10:00",
+            demo_mode=demo,
+            on_accept=lambda: print("уведомление: начать перерыв"),
+            on_snooze=lambda: print("уведомление: отложить"),
+            on_irrelevant=lambda: print("уведомление: неуместно"),
+            on_close=lambda: print("уведомление закрыто"),
+        )
+
+    windows = ctk.CTkFrame(root, fg_color="transparent")
+    windows.pack(fill="x", padx=10, pady=(10, 0))
+
+    ctk.CTkLabel(
+        windows,
+        text="отдельные окна:",
+        font=ctk.CTkFont(family=theme.FONT_FAMILY, size=12),
+        text_color=theme.TEXT_DIM,
+    ).pack(side="left", padx=(0, 8))
+
+    for caption, command in (
+        ("самооценка", open_self_report),
+        ("уведомление", lambda: open_toast(False)),
+        ("уведомление · демо", lambda: open_toast(True)),
+    ):
+        ctk.CTkButton(
+            windows,
+            text=caption,
+            font=ctk.CTkFont(family=theme.FONT_FAMILY, size=11),
+            height=26,
+            width=110,
+            corner_radius=theme.RADIUS_BUTTON,
+            fg_color="transparent",
+            hover_color=theme.CARD,
+            text_color=theme.TEXT_SECONDARY,
+            border_width=1,
+            border_color=theme.BORDER,
+            command=command,
+        ).pack(side="left", padx=(0, 8))
 
     switcher = ctk.CTkFrame(root, fg_color="transparent")
     switcher.pack(fill="x", padx=10, pady=10)

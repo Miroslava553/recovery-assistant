@@ -1,53 +1,46 @@
+"""Приложение ассистента восстановления на новом экране.
+
+Окно ничего не решает само: оно опрашивает `SessionMonitor`, отдаёт сигналы
+`AdaptiveRecoveryEngine`, переводит его ответ в `MainScreenView` через
+`ui.presenter` и рисует. Вся логика остаётся в `app_core` и проверяется
+тестами.
+"""
+
 from __future__ import annotations
 
 import argparse
 import time
 import tkinter as tk
-from dataclasses import fields, is_dataclass
 from pathlib import Path
-from tkinter import messagebox, scrolledtext, ttk
+from tkinter import messagebox, ttk
 
-try:
-    import winsound
-except ImportError:  # pragma: no cover - Windows-specific helper.
-    winsound = None
-
+import customtkinter as ctk
 import cv2
 import numpy as np
 
+try:
+    import winsound
+except ImportError:  # не Windows
+    winsound = None
+
 from app_core.recovery_engine import (
     AdaptiveRecoveryEngine,
-    AssessmentReliability,
-    EvidenceSource,
     RecoveryAssessment,
     RecoveryRecommendation,
     RecoverySignals,
-    WorkloadLevel,
     build_recovery_signals,
 )
 from app_core.recovery_storage import RecoveryEventStore
 from app_core.session_monitor import SessionMonitor
-from app_core.state_machine import UserState
+from app_core.state_machine import UserStateManager
 from app_core.storage import AppDatabase
 from app_core.typing_baseline import TypingBaselineService
-from ui.formatting import (
-    format_assessment_age,
-    format_duration,
-    format_optional,
-    neighbor_description,
-    recommended_action,
-    self_report_description,
-    user_facing_summary,
-)
-from ui.labels import (
-    EVIDENCE_SOURCE_LABELS,
-    FATIGUE_SP_LABELS,
-    SLEEPINESS_KSS_LABELS,
-    STATE_USER_LABELS,
-)
+from ui import theme
+from ui.formatting import dataclass_items, format_duration
+from ui.main_screen import MainScreen
+from ui.presenter import build_main_screen_view
 from ui.self_report import SelfReportDialog
 from ui.toast import RecommendationToast
-
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DATABASE_PATH = PROJECT_ROOT / "data" / "fatigue_assistant.sqlite3"
@@ -56,15 +49,14 @@ DATABASE_PATH = PROJECT_ROOT / "data" / "fatigue_assistant.sqlite3"
 class RecoveryAssistantApp:
     ASSESSMENT_POLL_MS = 1000
     PREVIEW_POLL_MS = 100
-    PREVIEW_WIDTH = 520
-    PREVIEW_HEIGHT = 390
 
-    def __init__(self, root: tk.Tk, *, demo_mode: bool) -> None:
+    def __init__(self, root: ctk.CTk, *, demo_mode: bool) -> None:
         self.root = root
         self.demo_mode = bool(demo_mode)
         self.root.title("Ассистент восстановления")
-        self.root.geometry("960x690")
-        self.root.minsize(880, 650)
+        self.root.geometry("820x900")
+        self.root.minsize(620, 700)
+        self.root.configure(fg_color=theme.BG)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         database = AppDatabase(DATABASE_PATH)
@@ -76,13 +68,18 @@ class RecoveryAssistantApp:
             min_observation_sec=50.0,
             target_relevant_keys=25,
         )
+        # Разогрев после перерыва не останавливает счётчики: он только
+        # запрещает складывать первые секунды печати в личную норму.
+        # В демо-режиме он короче, чтобы не ждать минуту при проверке.
+        self.baseline_warmup_sec = 6.0 if self.demo_mode else 60.0
         self.monitor = SessionMonitor(
             typing_baseline_service=self.typing_baseline,
             target_visual_fps=20.0,
             include_diagnostic_frame=False,
-            # Basic mode: занятая или отсутствующая камера не должна мешать
-            # работе остальных каналов.
             vision_required=False,
+            state_manager=UserStateManager(
+                baseline_warmup_sec=self.baseline_warmup_sec
+            ),
         )
         self.store = RecoveryEventStore(DATABASE_PATH, profile_id=self.profile_id)
 
@@ -103,253 +100,48 @@ class RecoveryAssistantApp:
 
         self._monitor_running = False
         self._manual_break = False
-        self._last_assessment: RecoveryAssessment | None = None
-        self._last_signals: RecoverySignals | None = None
         self._closing = False
-        self._last_recommendation_id: int | None = None
-        self._notification_window: tk.Toplevel | None = None
+        self._last_assessment: RecoveryAssessment | None = None
+        self._notification: RecommendationToast | None = None
         self._notification_recommendation_id: int | None = None
-        self._details_visible = False
 
-        self._camera_window: tk.Toplevel | None = None
-        self._camera_canvas: tk.Canvas | None = None
         self._camera_photo: tk.PhotoImage | None = None
         self._last_preview_captured_at: float | None = None
+        self._technical_window: tk.Toplevel | None = None
+        self._technical_text: tk.Text | None = None
+        self._technical_body = ""
 
-        self._create_style()
-        self._create_widgets()
+        self.screen = MainScreen(
+            self.root,
+            on_start_break=self._toggle_break,
+            on_snooze=self._snooze,
+            on_dismiss=self._mark_irrelevant,
+            on_self_report=self._self_report,
+            on_technical=self._toggle_technical,
+            on_monitoring_click=self._toggle_camera_preview,
+        )
+        self.screen.pack(fill="both", expand=True, padx=10, pady=10)
+
         self._start_monitor()
         self.root.after(self.ASSESSMENT_POLL_MS, self._poll)
         self.root.after(self.PREVIEW_POLL_MS, self._poll_camera_preview)
 
-    def _create_style(self) -> None:
-        style = ttk.Style(self.root)
-        try:
-            style.theme_use("vista")
-        except tk.TclError:
-            pass
-        style.configure("AppTitle.TLabel", font=("Segoe UI", 20, "bold"))
-        style.configure("SectionTag.TLabel", font=("Segoe UI", 9, "bold"))
-        style.configure("Hero.TLabel", font=("Segoe UI", 19, "bold"))
-        style.configure("State.TLabel", font=("Segoe UI", 11, "bold"))
-        style.configure("Body.TLabel", font=("Segoe UI", 10))
-        style.configure("Small.TLabel", font=("Segoe UI", 9))
-        style.configure("Card.TLabelframe.Label", font=("Segoe UI", 10, "bold"))
-        style.configure("Primary.TButton", font=("Segoe UI", 10, "bold"), padding=(14, 8))
-        style.configure("Secondary.TButton", padding=(12, 8))
-
-    def _create_widgets(self) -> None:
-        outer = ttk.Frame(self.root, padding=18)
-        outer.pack(fill="both", expand=True)
-        self.outer = outer
-
-        header = ttk.Frame(outer)
-        header.pack(fill="x", pady=(0, 10))
-        ttk.Label(header, text="Ассистент восстановления", style="AppTitle.TLabel").pack(
-            side="left"
-        )
-        self.monitor_badge_var = tk.StringVar(value="● Запуск")
-        ttk.Label(header, textvariable=self.monitor_badge_var, style="State.TLabel").pack(
-            side="right"
-        )
-
-        if self.demo_mode:
-            demo_banner = tk.Frame(outer, background="#fff3cd", padx=12, pady=8)
-            demo_banner.pack(fill="x", pady=(0, 10))
-            tk.Label(
-                demo_banner,
-                text=(
-                    "ДЕМО-РЕЖИМ: временные пороги ускорены. Уведомления в этом режиме "
-                    "проверяют интерфейс и не являются выводом об усталости."
-                ),
-                background="#fff3cd",
-                foreground="#5f4700",
-                font=("Segoe UI", 9, "bold"),
-                anchor="w",
-            ).pack(fill="x")
-
-        # На основном экране только три смысловых блока.
-        self._build_status_card(outer)
-        self._build_reason_card(outer)
-        self._build_action_card(outer)
-        self._build_footer(outer)
-        self._build_details_panel(outer)
-
-    def _build_status_card(self, parent: ttk.Frame) -> None:
-        card = ttk.LabelFrame(parent, text="1. СОСТОЯНИЕ", padding=14)
-        card.pack(fill="x", pady=(0, 10))
-
-        self.context_var = tk.StringVar(value="Контекст уточняется")
-        ttk.Label(card, textvariable=self.context_var, style="Small.TLabel").pack(anchor="w")
-
-        self.hero_title_var = tk.StringVar(value="Оценка запускается")
-        ttk.Label(
-            card,
-            textvariable=self.hero_title_var,
-            style="Hero.TLabel",
-            wraplength=840,
-        ).pack(anchor="w", pady=(4, 3))
-
-        self.hero_text_var = tk.StringVar(value="Подготавливаю датчики и личные настройки.")
-        ttk.Label(
-            card,
-            textvariable=self.hero_text_var,
-            style="Body.TLabel",
-            wraplength=840,
-        ).pack(anchor="w")
-
-        self.session_context_var = tk.StringVar(
-            value="Непрерывная работа: 00:00   ·   Оценка обновлена: сейчас"
-        )
-        ttk.Label(
-            card,
-            textvariable=self.session_context_var,
-            style="Small.TLabel",
-            foreground="#333333",
-        ).pack(anchor="w", pady=(7, 0))
-
-        self.reliability_var = tk.StringVar(value="Оценка ограничена")
-        ttk.Label(
-            card,
-            textvariable=self.reliability_var,
-            style="Small.TLabel",
-            foreground="#555555",
-        ).pack(anchor="w", pady=(2, 0))
-
-    def _build_reason_card(self, parent: ttk.Frame) -> None:
-        card = ttk.LabelFrame(parent, text="2. ОСНОВАНИЕ", padding=14)
-        card.pack(fill="x", pady=(0, 10))
-        self.reason1_var = tk.StringVar(value="Собираются первые измерения")
-        self.reason2_var = tk.StringVar(value="Личная норма ритма ещё формируется")
-        ttk.Label(card, textvariable=self.reason1_var, style="State.TLabel", wraplength=840).pack(
-            anchor="w"
-        )
-        ttk.Label(card, textvariable=self.reason2_var, style="Body.TLabel", wraplength=840).pack(
-            anchor="w", pady=(5, 0)
-        )
-
-    def _build_action_card(self, parent: ttk.Frame) -> None:
-        card = ttk.LabelFrame(parent, text="3. РЕКОМЕНДАЦИЯ", padding=14)
-        card.pack(fill="x", pady=(0, 10))
-
-        self.action_title_var = tk.StringVar(value="Продолжайте работу в обычном режиме")
-        ttk.Label(
-            card,
-            textvariable=self.action_title_var,
-            style="State.TLabel",
-            wraplength=840,
-        ).pack(anchor="w")
-        self.action_text_var = tk.StringVar(
-            value="Система продолжает наблюдение и уточняет личный рабочий диапазон."
-        )
-        ttk.Label(
-            card,
-            textvariable=self.action_text_var,
-            style="Body.TLabel",
-            wraplength=840,
-        ).pack(anchor="w", pady=(4, 10))
-
-        actions = ttk.Frame(card)
-        actions.pack(fill="x")
-        self.break_button = ttk.Button(
-            actions,
-            text="Начать перерыв",
-            command=self._toggle_break,
-            style="Primary.TButton",
-        )
-        self.break_button.pack(side="left")
-        self.snooze_button = ttk.Button(
-            actions,
-            text="Отложить 10 минут",
-            command=self._snooze,
-            style="Secondary.TButton",
-            state="disabled",
-        )
-        self.snooze_button.pack(side="left", padx=(8, 0))
-        self.irrelevant_button = ttk.Button(
-            actions,
-            text="Неуместно",
-            command=self._mark_irrelevant,
-            style="Secondary.TButton",
-            state="disabled",
-        )
-        self.irrelevant_button.pack(side="left", padx=(8, 0))
-
-    def _build_footer(self, parent: ttk.Frame) -> None:
-        footer = ttk.Frame(parent)
-        footer.pack(fill="x")
-
-        ttk.Button(
-            footer,
-            text="Как я себя чувствую",
-            command=self._self_report,
-            style="Secondary.TButton",
-        ).pack(side="left")
-
-        self.camera_status_var = tk.StringVar(value="● Камера: проверяю сигнал")
-        ttk.Button(
-            footer,
-            textvariable=self.camera_status_var,
-            command=self._toggle_camera_preview,
-            style="Secondary.TButton",
-        ).pack(side="left", padx=(8, 0))
-
-        self.pause_button = ttk.Button(
-            footer,
-            text="Приостановить",
-            command=self._toggle_monitor,
-            style="Secondary.TButton",
-        )
-        self.pause_button.pack(side="left", padx=(8, 0))
-
-        self.details_button = ttk.Button(
-            footer,
-            text="Подробнее ▾",
-            command=self._toggle_details,
-            style="Secondary.TButton",
-        )
-        self.details_button.pack(side="right")
-
-    def _build_details_panel(self, parent: ttk.Frame) -> None:
-        self.details_frame = ttk.LabelFrame(
-            parent,
-            text="Технические подробности",
-            padding=8,
-        )
-        self.details_notebook = ttk.Notebook(self.details_frame)
-        self.details_notebook.pack(fill="both", expand=True)
-
-        self.detail_texts: dict[str, scrolledtext.ScrolledText] = {}
-        for title in ("Сессия", "Печать", "Глаза", "Решение"):
-            frame = ttk.Frame(self.details_notebook, padding=6)
-            text = scrolledtext.ScrolledText(
-                frame,
-                height=15,
-                wrap="word",
-                state="disabled",
-                font=("Consolas", 9),
-            )
-            text.pack(fill="both", expand=True)
-            self.details_notebook.add(frame, text=title)
-            self.detail_texts[title] = text
-
+    # ------------------------------------------------------------------ запуск
     def _start_monitor(self) -> None:
+        if self._monitor_running:
+            return
         try:
             self.monitor.start()
         except Exception as error:
             messagebox.showerror(
-                "Не удалось запустить монитор",
+                "Не удалось запустить мониторинг",
                 f"{type(error).__name__}: {error}",
                 parent=self.root,
             )
-            self.monitor_badge_var.set("● Ошибка")
             return
+
         self._monitor_running = True
-        self.pause_button.configure(text="Приостановить")
-        if self.monitor.vision_available:
-            self.monitor_badge_var.set("● Мониторинг включён")
-        else:
-            self.monitor_badge_var.set("● Мониторинг включён (без камеры)")
+        if not self.monitor.vision_available:
             messagebox.showwarning(
                 "Камера недоступна",
                 "Визуальный канал отключён, остальные продолжают работать.\n\n"
@@ -364,6 +156,7 @@ class RecoveryAssistantApp:
             },
         )
 
+    # -------------------------------------------------------------------- цикл
     def _poll(self) -> None:
         if self._closing:
             return
@@ -373,49 +166,13 @@ class RecoveryAssistantApp:
                 signals = build_recovery_signals(snapshot, self.typing_baseline)
                 assessment = self.engine.update(signals)
                 self._last_assessment = assessment
-                self._last_signals = signals
                 self._render(snapshot, signals, assessment)
                 if assessment.recommendation_is_new and assessment.recommendation is not None:
                     self._log_recommendation(assessment.recommendation)
                     self._show_recommendation_notification(assessment.recommendation)
             except Exception as error:
-                self.monitor_badge_var.set("● Ошибка датчика")
-                self.hero_title_var.set("Оценка временно недоступна")
-                self.hero_text_var.set(f"{type(error).__name__}: {error}")
+                self._render_sensor_error(error)
         self.root.after(self.ASSESSMENT_POLL_MS, self._poll)
-
-    def _poll_camera_preview(self) -> None:
-        if self._closing:
-            return
-        window = self._camera_window
-        canvas = self._camera_canvas
-        if (
-            self._monitor_running
-            and window is not None
-            and canvas is not None
-        ):
-            try:
-                if window.winfo_exists():
-                    captured_at, frame = self.monitor.latest_visual_frame()
-                    if (
-                        frame is not None
-                        and captured_at is not None
-                        and captured_at != self._last_preview_captured_at
-                    ):
-                        self._camera_photo = self._frame_to_photo(frame)
-                        canvas.delete("all")
-                        canvas.create_image(
-                            self.PREVIEW_WIDTH // 2,
-                            self.PREVIEW_HEIGHT // 2,
-                            image=self._camera_photo,
-                            anchor="center",
-                        )
-                        self._last_preview_captured_at = captured_at
-            except tk.TclError:
-                self._close_camera_preview()
-            except Exception:
-                pass
-        self.root.after(self.PREVIEW_POLL_MS, self._poll_camera_preview)
 
     def _render(
         self,
@@ -423,71 +180,57 @@ class RecoveryAssistantApp:
         signals: RecoverySignals,
         assessment: RecoveryAssessment,
     ) -> None:
-        self.context_var.set(STATE_USER_LABELS.get(snapshot.state, snapshot.state_label))
-        title, detail = user_facing_summary(assessment, demo_mode=self.demo_mode)
-        self.hero_title_var.set(title)
-        self.hero_text_var.set(detail)
-        self.session_context_var.set(
-            "Непрерывная работа: "
-            + format_duration(assessment.continuous_work_sec)
-            + "   ·   Оценка обновлена: "
-            + format_assessment_age(time.monotonic() - assessment.captured_at)
+        view = build_main_screen_view(
+            snapshot,
+            signals,
+            assessment,
+            now=time.monotonic(),
+            monitoring=self._monitor_running,
+            vision_available=self.monitor.vision_available,
+            break_active=self._manual_break,
+            meaningful_break_sec=self.engine.meaningful_break_sec,
+            eye_rest_after_sec=self.engine.eye_rest_after_sec,
+            microbreak_after_sec=self.engine.microbreak_after_sec,
+            recovery_break_after_sec=self.engine.recovery_break_after_sec,
         )
-        self.reliability_var.set(assessment.reliability_label)
+        self.screen.render(view)
+        if self._technical_text is not None:
+            # Диагностическая панель не должна ронять оценку. Раньше ошибка
+            # внутри неё выходила наружу и останавливала весь цикл опроса:
+            # на экране появлялось «Ошибка датчика», хотя датчики работали.
+            try:
+                self._refresh_technical(snapshot, signals, assessment)
+            except Exception as error:
+                self._show_technical_error(error)
 
-        reasons = list(assessment.primary_reasons)
-        self.reason1_var.set(reasons[0] if reasons else "Достаточных оснований для изменения уровня пока нет")
-        self.reason2_var.set(reasons[1] if len(reasons) > 1 else assessment.decision_basis)
+    def _render_sensor_error(self, error: Exception) -> None:
+        """Ошибка датчика не должна выглядеть как вывод об усталости."""
 
-        self._render_camera_status(snapshot)
-        self._render_action(assessment)
-        if self._details_visible:
-            self._render_details(snapshot, signals, assessment)
+        from ui.view_model import MainScreenView
 
-    def _render_camera_status(self, snapshot) -> None:
-        ocular = snapshot.ocular_metrics
-        if snapshot.face_detected is True:
-            if ocular.signal_coverage >= 0.85:
-                self.camera_status_var.set("● Камера: сигнал устойчив")
-            else:
-                self.camera_status_var.set("● Камера: сигнал ограничен")
-        elif snapshot.face_detected is False:
-            self.camera_status_var.set("● Камера: лицо не в кадре")
-        else:
-            self.camera_status_var.set("● Камера: качество ограничено")
-
-    def _render_action(self, assessment: RecoveryAssessment) -> None:
-        recommendation = assessment.recommendation
-        if recommendation is None:
-            if self._notification_recommendation_id is not None:
-                self._close_recommendation_notification()
-            self.snooze_button.configure(state="disabled")
-            self.irrelevant_button.configure(state="disabled")
-
-            title, text = recommended_action(assessment)
-            self.action_title_var.set(title)
-            self.action_text_var.set(text)
-            return
-
-        self.snooze_button.configure(state="normal")
-        self.irrelevant_button.configure(state="normal")
-        if self.demo_mode:
-            self.action_title_var.set("ДЕМО: рекомендация сформирована")
-            self.action_text_var.set(
-                "Сработал ускоренный временной порог. Это проверка механизма уведомлений, а не вывод об усталости."
+        self.screen.render(
+            MainScreenView(
+                monitoring=False,
+                monitoring_text="Ошибка датчика",
+                work_time_text="--:--:--",
+                next_threshold_text="оценка приостановлена",
+                signal_value_text="нет",
+                signal_tone="off",
+                signal_hint="данные недоступны",
+                level=1,
+                level_title="Оценка временно недоступна",
+                action_title="Рекомендация недоступна",
+                action_text=f"{type(error).__name__}: {error}",
+                updated_text="обновлено сейчас",
             )
-        else:
-            self.action_title_var.set(recommendation.title)
-            self.action_text_var.set(recommendation.message)
+        )
 
+    # ------------------------------------------------------------ уведомление
     def _show_recommendation_notification(
-        self,
-        recommendation: RecoveryRecommendation,
+        self, recommendation: RecoveryRecommendation
     ) -> None:
         if self._notification_recommendation_id == recommendation.recommendation_id:
-            window = self._notification_window
-            if window is not None and window.winfo_exists():
-                return
+            return
 
         self._close_recommendation_notification()
         if self.demo_mode:
@@ -500,7 +243,7 @@ class RecoveryAssistantApp:
             title = recommendation.title
             message = recommendation.message
 
-        toast = RecommendationToast(
+        self._notification = RecommendationToast(
             self.root,
             title=title,
             message=message,
@@ -511,238 +254,32 @@ class RecoveryAssistantApp:
             on_irrelevant=self._mark_irrelevant,
             on_close=self._notification_closed,
         )
-        self._notification_window = toast.window
         self._notification_recommendation_id = recommendation.recommendation_id
         self._play_notification_sound()
 
     def _play_notification_sound(self) -> None:
-        if winsound is not None:
-            try:
-                winsound.MessageBeep(winsound.MB_ICONASTERISK)
-                return
-            except RuntimeError:
-                pass
+        if winsound is None:
+            return
         try:
-            self.root.bell()
-        except tk.TclError:
+            winsound.MessageBeep(winsound.MB_ICONASTERISK)
+        except Exception:
             pass
 
     def _notification_closed(self) -> None:
-        self._notification_window = None
+        self._notification = None
+        self._notification_recommendation_id = None
 
     def _close_recommendation_notification(self) -> None:
-        window = self._notification_window
-        self._notification_window = None
+        toast = self._notification
+        self._notification = None
         self._notification_recommendation_id = None
-        if window is not None:
+        if toast is not None:
             try:
-                if window.winfo_exists():
-                    window.destroy()
-            except tk.TclError:
+                toast.close()
+            except Exception:
                 pass
 
-    def _toggle_camera_preview(self) -> None:
-        if self._camera_window is not None:
-            try:
-                if self._camera_window.winfo_exists():
-                    self._close_camera_preview()
-                    return
-            except tk.TclError:
-                pass
-
-        window = tk.Toplevel(self.root)
-        window.title("Камера — диагностическое превью")
-        window.resizable(False, False)
-        window.protocol("WM_DELETE_WINDOW", self._close_camera_preview)
-        container = ttk.Frame(window, padding=10)
-        container.pack(fill="both", expand=True)
-        canvas = tk.Canvas(
-            container,
-            width=self.PREVIEW_WIDTH,
-            height=self.PREVIEW_HEIGHT,
-            background="#202124",
-            highlightthickness=0,
-        )
-        canvas.pack()
-        canvas.create_text(
-            self.PREVIEW_WIDTH // 2,
-            self.PREVIEW_HEIGHT // 2,
-            text="Получаю изображение…",
-            fill="white",
-            font=("Segoe UI", 11),
-        )
-        ttk.Label(
-            container,
-            text="Превью не сохраняется. Закрытие окна прекращает только его отрисовку.",
-            wraplength=self.PREVIEW_WIDTH,
-        ).pack(anchor="w", pady=(8, 0))
-        self._camera_window = window
-        self._camera_canvas = canvas
-        self._last_preview_captured_at = None
-
-    def _close_camera_preview(self) -> None:
-        window = self._camera_window
-        self._camera_window = None
-        self._camera_canvas = None
-        self._camera_photo = None
-        self._last_preview_captured_at = None
-        if window is not None:
-            try:
-                if window.winfo_exists():
-                    window.destroy()
-            except tk.TclError:
-                pass
-
-    def _frame_to_photo(self, frame) -> tk.PhotoImage:
-        height, width = frame.shape[:2]
-        scale = min(self.PREVIEW_WIDTH / width, self.PREVIEW_HEIGHT / height)
-        target_w = max(1, int(width * scale))
-        target_h = max(1, int(height * scale))
-        resized = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_AREA)
-
-        canvas = np.full((self.PREVIEW_HEIGHT, self.PREVIEW_WIDTH, 3), 32, dtype=np.uint8)
-        x0 = (self.PREVIEW_WIDTH - target_w) // 2
-        y0 = (self.PREVIEW_HEIGHT - target_h) // 2
-        canvas[y0 : y0 + target_h, x0 : x0 + target_w] = resized
-
-        rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
-        header = f"P6\n{self.PREVIEW_WIDTH} {self.PREVIEW_HEIGHT}\n255\n".encode("ascii")
-        ppm = header + rgb.tobytes()
-        return tk.PhotoImage(data=ppm, format="PPM")
-
-    def _toggle_details(self) -> None:
-        self._details_visible = not self._details_visible
-        if self._details_visible:
-            self.details_frame.pack(fill="both", expand=True, pady=(10, 0))
-            self.details_button.configure(text="Подробнее ▴")
-            self.root.geometry("1000x900")
-            if self._last_assessment is not None and self._last_signals is not None:
-                try:
-                    snapshot = self.monitor.snapshot()
-                    self._render_details(snapshot, self._last_signals, self._last_assessment)
-                except Exception:
-                    pass
-        else:
-            self.details_frame.pack_forget()
-            self.details_button.configure(text="Подробнее ▾")
-            self.root.geometry("960x690")
-
-    def _render_details(
-        self,
-        snapshot,
-        signals: RecoverySignals,
-        assessment: RecoveryAssessment,
-    ) -> None:
-        session_lines = [
-            "РАБОЧИЙ КОНТЕКСТ",
-            f"state = {snapshot.state.value}",
-            f"state_label = {snapshot.state_label}",
-            f"state_reason = {snapshot.state_reason}",
-            f"seconds_in_state = {snapshot.seconds_in_state:.2f}",
-            f"input_idle_sec = {format_optional(snapshot.input_idle_sec)}",
-            f"face_detected = {format_optional(snapshot.face_detected)}",
-            f"gaze_on_screen = {format_optional(snapshot.gaze_on_screen)}",
-            f"fatigue_analysis_allowed = {snapshot.fatigue_analysis_allowed}",
-            f"baseline_update_allowed = {snapshot.baseline_update_allowed}",
-            f"camera_status = {snapshot.camera_status}",
-            f"attention_status = {snapshot.attention_status}",
-            f"ocular_status = {snapshot.ocular_status}",
-            f"visual_age_sec = {snapshot.visual_age_sec:.3f}",
-            "",
-            "НАКОПЛЕНИЕ",
-            f"continuous_work_sec = {assessment.continuous_work_sec:.2f}",
-            f"current_break_sec = {assessment.current_break_sec:.2f}",
-            f"typing_calibration_progress = {assessment.typing_calibration_progress:.3f}",
-            f"self_report_fatigue_sp = {format_optional(assessment.self_report_fatigue_sp)}",
-            f"self_report_sleepiness_kss = {format_optional(assessment.self_report_sleepiness_kss)}",
-        ]
-
-        typing_lines = ["ТЕКУЩЕЕ ОКНО ПЕЧАТИ"]
-        typing_lines.extend(self._dataclass_lines(snapshot.typing_metrics))
-        typing_lines.extend(["", "СРАВНЕНИЕ С ЛИЧНОЙ НОРМОЙ"])
-        for feature_name, deviation in signals.typing_deviations.items():
-            typing_lines.extend(
-                [
-                    f"[{feature_name}]",
-                    f"  actual = {format_optional(deviation.actual_value)}",
-                    f"  baseline_median = {format_optional(deviation.baseline_median)}",
-                    f"  robust_z = {format_optional(deviation.robust_z)}",
-                    f"  ready = {deviation.ready}",
-                    f"  confidence = {deviation.confidence:.3f}",
-                ]
-            )
-
-        ocular_lines = ["ГЛАЗНОЙ КАНАЛ — ДИАГНОСТИКА"]
-        ocular_lines.append(
-            "До завершения размеченной валидации эти показатели не меняют итоговый уровень."
-        )
-        ocular_lines.append("")
-        ocular_lines.extend(self._dataclass_lines(snapshot.ocular_metrics))
-
-        diagnostics = self.engine.diagnostics(captured_at=assessment.captured_at)
-        decision_lines = [
-            "ИТОГОВАЯ ЛОГИКА",
-            f"workload_level = {int(assessment.workload_level)}",
-            f"workload_title = {assessment.workload_title}",
-            f"reliability = {assessment.reliability.value}",
-            f"reliability_detail = {assessment.reliability_detail}",
-            f"decision_basis = {assessment.decision_basis}",
-            f"ocular_used_for_decision = {assessment.ocular_used_for_decision}",
-            "contributing_sources = "
-            + ", ".join(EVIDENCE_SOURCE_LABELS[source] for source in assessment.contributing_sources),
-            "",
-            "ГИСТЕРЕЗИС И ОГРАНИЧЕНИЯ",
-        ]
-        decision_lines.extend(f"{key} = {format_optional(value)}" for key, value in diagnostics.items())
-        decision_lines.extend(["", "ДОКАЗАТЕЛЬСТВА"])
-        if assessment.evidence:
-            for item in assessment.evidence:
-                decision_lines.extend(
-                    [
-                        f"[{item.code}] source={item.source.value}; severity={item.severity}; decision_ready={item.decision_ready}",
-                        f"  {item.title}",
-                        f"  {item.detail}",
-                    ]
-                )
-        else:
-            decision_lines.append("нет активных положительных сигналов")
-
-        if assessment.recommendation is not None:
-            recommendation = assessment.recommendation
-            decision_lines.extend(
-                [
-                    "",
-                    "РЕКОМЕНДАЦИЯ",
-                    f"id = {recommendation.recommendation_id}",
-                    f"kind = {recommendation.kind.value}",
-                    f"title = {recommendation.title}",
-                    f"message = {recommendation.message}",
-                    f"suggested_break_sec = {recommendation.suggested_break_sec:.1f}",
-                    f"reason_codes = {', '.join(recommendation.reason_codes)}",
-                ]
-            )
-
-        self._set_detail_text("Сессия", "\n".join(session_lines))
-        self._set_detail_text("Печать", "\n".join(typing_lines))
-        self._set_detail_text("Глаза", "\n".join(ocular_lines))
-        self._set_detail_text("Решение", "\n".join(decision_lines))
-
-    @staticmethod
-    def _dataclass_lines(value) -> list[str]:
-        if not is_dataclass(value):
-            return [str(value)]
-        result: list[str] = []
-        for field in fields(value):
-            result.append(f"{field.name} = {format_optional(getattr(value, field.name))}")
-        return result
-
-    def _set_detail_text(self, title: str, content: str) -> None:
-        widget = self.detail_texts[title]
-        widget.configure(state="normal")
-        widget.delete("1.0", tk.END)
-        widget.insert("1.0", content)
-        widget.configure(state="disabled")
-
+    # ------------------------------------------------------------- действия
     def _toggle_break(self) -> None:
         if self._manual_break:
             self._finish_break()
@@ -755,8 +292,8 @@ class RecoveryAssistantApp:
         recommendation = self.engine.current_recommendation
         self._manual_break = True
         self.monitor.set_manual_break(True)
-        self.break_button.configure(text="Закончить перерыв")
         resolved = self.engine.resolve_recommendation(captured_at=time.monotonic())
+        self.engine.begin_manual_break()
         self.store.log_event(
             "break_started",
             recommendation_id=(resolved.recommendation_id if resolved else None),
@@ -773,7 +310,7 @@ class RecoveryAssistantApp:
             return
         self._manual_break = False
         self.monitor.set_manual_break(False)
-        self.break_button.configure(text="Начать перерыв")
+        self.engine.end_manual_break()
         self.store.log_event("break_finished")
 
     def _snooze(self) -> None:
@@ -803,21 +340,18 @@ class RecoveryAssistantApp:
 
     def _self_report(self) -> None:
         assessment = self._last_assessment
-        initial_fatigue = assessment.self_report_fatigue_sp if assessment else None
-        initial_sleepiness = assessment.self_report_sleepiness_kss if assessment else None
         SelfReportDialog(
             self.root,
-            initial_fatigue=initial_fatigue,
-            initial_sleepiness=initial_sleepiness,
+            initial_fatigue=assessment.self_report_fatigue_sp if assessment else None,
+            initial_sleepiness=assessment.self_report_sleepiness_kss if assessment else None,
             on_save=self._save_self_report,
         )
 
     def _save_self_report(self, fatigue_sp: int, sleepiness_kss: int) -> None:
-        now = time.monotonic()
         self.engine.record_self_report(
             fatigue_sp_1_7=float(fatigue_sp),
             sleepiness_kss_1_9=float(sleepiness_kss),
-            captured_at=now,
+            captured_at=time.monotonic(),
         )
         self.store.add_self_report(
             fatigue_sp_1_7=float(fatigue_sp),
@@ -831,22 +365,7 @@ class RecoveryAssistantApp:
             },
         )
 
-    def _toggle_monitor(self) -> None:
-        if self._monitor_running:
-            try:
-                self.monitor.stop()
-            finally:
-                self._monitor_running = False
-                self._close_recommendation_notification()
-                self._close_camera_preview()
-                self.pause_button.configure(text="Возобновить")
-                self.monitor_badge_var.set("● Мониторинг остановлен")
-                self.store.log_event("monitor_paused")
-        else:
-            self._start_monitor()
-
     def _log_recommendation(self, recommendation: RecoveryRecommendation) -> None:
-        self._last_recommendation_id = recommendation.recommendation_id
         self.store.log_event(
             "recommendation_created",
             recommendation_id=recommendation.recommendation_id,
@@ -859,12 +378,288 @@ class RecoveryAssistantApp:
             },
         )
 
+    # -------------------------------------------------- технические показатели
+    def _toggle_technical(self) -> None:
+        window = self._technical_window
+        if window is not None:
+            try:
+                if window.winfo_exists():
+                    # Спрятанное окно надо показать, а не закрыть. Иначе
+                    # нажатие выглядит как «открылось и сразу пропало»:
+                    # первое нажатие создаёт окно, которое остаётся
+                    # невидимым, второе его уничтожает.
+                    if not window.winfo_viewable():
+                        self._reveal_technical(window)
+                    else:
+                        self._close_technical()
+                    return
+            except tk.TclError:
+                self._technical_window = None
+                self._technical_text = None
+
+        window = ctk.CTkToplevel(self.root)
+        # Ссылку сохраняем сразу. Если сборка окна дальше упадёт, локальная
+        # переменная исчезнет вместе с окном, и вместо понятной ошибки
+        # получится молчаливое мигание.
+        self._technical_window = window
+        window.title("Технические показатели")
+        window.geometry("760x620")
+        window.minsize(520, 360)
+        window.configure(fg_color=theme.BG)
+        window.protocol("WM_DELETE_WINDOW", self._close_technical)
+
+        header = ctk.CTkFrame(window, fg_color="transparent")
+        header.pack(fill="x", padx=14, pady=(14, 0))
+        ctk.CTkLabel(
+            header,
+            text="Сырые показатели каналов",
+            font=ctk.CTkFont(family=theme.FONT_FAMILY, size=13, weight="bold"),
+            text_color=theme.TEXT,
+            anchor="w",
+        ).pack(side="left")
+        ctk.CTkLabel(
+            header,
+            text="обновляется раз в секунду",
+            font=ctk.CTkFont(family=theme.FONT_FAMILY, size=11),
+            text_color=theme.TEXT_DIM,
+            anchor="e",
+        ).pack(side="right")
+
+        box = ctk.CTkFrame(
+            window,
+            fg_color=theme.CARD,
+            corner_radius=theme.RADIUS_CARD,
+        )
+        box.pack(fill="both", expand=True, padx=14, pady=14)
+
+        # Здесь намеренно остаётся tk.Text: у CustomTkinter нет виджета с
+        # моноширинным выводом и прокруткой, а ровные колонки чисел для
+        # диагностики важнее единообразия.
+        text = tk.Text(
+            box,
+            wrap="none",
+            font=("Consolas", 10),
+            background=theme.CARD,
+            foreground=theme.TEXT_SECONDARY,
+            insertbackground=theme.TEXT_SECONDARY,
+            selectbackground=theme.ACTION_PRIMARY,
+            borderwidth=0,
+            highlightthickness=0,
+            padx=12,
+            pady=10,
+        )
+        vertical = ctk.CTkScrollbar(box, command=text.yview)
+        horizontal = ctk.CTkScrollbar(box, orientation="horizontal", command=text.xview)
+        text.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
+
+        horizontal.pack(side="bottom", fill="x", padx=(6, 6), pady=(0, 6))
+        vertical.pack(side="right", fill="y", padx=(0, 6), pady=6)
+        text.pack(side="left", fill="both", expand=True)
+        text.configure(state="disabled")
+
+        self._technical_body = ""
+        self._technical_text = text
+
+        # CustomTkinter после создания окна сам ненадолго прячет его, чтобы
+        # перекрасить рамку заголовка под тёмную тему, и возвращает обратно
+        # с задержкой. Показываем окно уже после этого.
+        self._reveal_technical(window)
+        window.after(350, lambda: self._reveal_technical(window))
+
+    def _reveal_technical(self, window) -> None:
+        """Показать окно наверняка."""
+
+        try:
+            if not window.winfo_exists():
+                return
+            window.deiconify()
+            window.lift()
+            window.focus_force()
+        except tk.TclError:
+            pass
+
+    def _show_technical_error(self, error: Exception) -> None:
+        """Показать поломку диагностики в самой диагностике.
+
+        Молча проглотить её нельзя: панель нужна именно для того, чтобы
+        видеть, что происходит внутри. Но и наружу выпускать не стоит —
+        неисправный термометр не означает, что больной умер.
+        """
+
+        text = self._technical_text
+        if text is None:
+            return
+        body = (
+            "Панель технических показателей не смогла собрать данные.\n\n"
+            f"{type(error).__name__}: {error}\n\n"
+            "Оценка при этом продолжает работать: сбой касается только "
+            "этого окна."
+        )
+        if body == self._technical_body:
+            return
+        self._technical_body = body
+        try:
+            text.configure(state="normal")
+            text.delete("1.0", "end")
+            text.insert("1.0", body)
+            text.configure(state="disabled")
+        except tk.TclError:
+            pass
+
+    def _close_technical(self) -> None:
+        window = self._technical_window
+        self._technical_window = None
+        self._technical_text = None
+        self._technical_body = ""
+        if window is not None:
+            try:
+                if window.winfo_exists():
+                    window.destroy()
+            except tk.TclError:
+                pass
+
+    def _refresh_technical(self, snapshot, signals, assessment) -> None:
+        text = self._technical_text
+        if text is None:
+            return
+        lines: list[str] = []
+
+        lines.append("=== РАБОЧИЙ КОНТЕКСТ ===")
+        lines.append(f"состояние: {snapshot.state_label}")
+        lines.append(f"причина: {snapshot.state_reason}")
+        lines.append(f"в состоянии, с: {snapshot.seconds_in_state:.1f}")
+        lines.append(f"без ввода, с: {snapshot.input_idle_sec}")
+        lines.append(f"анализ разрешён: {snapshot.fatigue_analysis_allowed}")
+
+        lines.append("")
+        lines.append("=== КАМЕРА И ГЛАЗА ===")
+        lines.append(f"камера: {snapshot.camera_status}")
+        lines.append(f"внимание: {snapshot.attention_status}")
+        lines.append(f"глаза: {snapshot.ocular_status}")
+        lines.append(f"лицо в кадре: {snapshot.face_detected}")
+        lines.append(f"взгляд к экрану: {snapshot.gaze_on_screen}")
+        lines.append(f"возраст кадра, с: {snapshot.visual_age_sec:.2f}")
+        for key, value in dataclass_items(snapshot.ocular_metrics):
+            lines.append(f"  {key}: {value}")
+
+        lines.append("")
+        lines.append("=== ПЕЧАТЬ ===")
+        for key, value in dataclass_items(snapshot.typing_metrics):
+            lines.append(f"  {key}: {value}")
+        lines.append(f"личная норма готова: {signals.typing_baseline_ready}")
+        lines.append(f"калибровка: {signals.typing_calibration_progress:.0%}")
+        for name, deviation in sorted(signals.typing_deviations.items()):
+            lines.append(
+                f"  {name}: z={deviation.robust_z}, готов={deviation.ready}, "
+                f"медиана={deviation.baseline_median}"
+            )
+
+        lines.append("")
+        lines.append("=== РЕШЕНИЕ ===")
+        lines.append(f"уровень: {int(assessment.workload_level)} — {assessment.workload_title}")
+        lines.append(f"надёжность: {assessment.reliability_label}")
+        lines.append(f"основание: {assessment.decision_basis}")
+        lines.append(f"глаза влияют на решение: {assessment.ocular_used_for_decision}")
+        for item in assessment.evidence:
+            mark = "+" if item.decision_ready else "·"
+            lines.append(f"  {mark} [{item.source}] {item.code} (сила {item.severity})")
+        for key, value in sorted(
+            self.engine.diagnostics(captured_at=time.monotonic()).items()
+        ):
+            lines.append(f"  {key}: {value}")
+
+        body = "\n".join(lines)
+        if body == self._technical_body:
+            return  # ничего не изменилось, перерисовывать нечего
+        self._technical_body = body
+
+        # Панель обновляется раз в секунду. Полная перезапись стирала позицию
+        # прокрутки и дёргала виджет, поэтому запоминаем её и возвращаем.
+        position = text.yview()[0]
+        text.configure(state="normal")
+        text.delete("1.0", "end")
+        text.insert("1.0", body)
+        text.configure(state="disabled")
+        text.yview_moveto(position)
+
+    # ------------------------------------------------------------ превью камеры
+    def _toggle_camera_preview(self) -> None:
+        if self.screen.camera_visible:
+            self.screen.hide_camera()
+            self._last_preview_captured_at = None
+            return
+
+        if not self.monitor.vision_available:
+            messagebox.showinfo(
+                "Камера недоступна",
+                "Визуальный канал сейчас отключён, показывать нечего.",
+                parent=self.root,
+            )
+            return
+
+        self._last_preview_captured_at = None
+        self.screen.set_camera_placeholder("ожидание кадра с камеры")
+        self.screen.show_camera()
+
+    def _poll_camera_preview(self) -> None:
+        if self._closing:
+            return
+        if self._monitor_running and self.screen.camera_visible:
+            try:
+                captured_at, frame = self.monitor.latest_visual_frame()
+                if (
+                    frame is not None
+                    and captured_at is not None
+                    and captured_at != self._last_preview_captured_at
+                ):
+                    canvas = self.screen.camera_canvas
+                    self._camera_photo = self._frame_to_photo(frame)
+                    canvas.delete("all")
+                    canvas.create_image(
+                        self.screen.CAMERA_WIDTH // 2,
+                        self.screen.CAMERA_HEIGHT // 2,
+                        image=self._camera_photo,
+                        anchor="center",
+                    )
+                    self._last_preview_captured_at = captured_at
+            except tk.TclError:
+                pass
+            except Exception:
+                pass
+        self.root.after(self.PREVIEW_POLL_MS, self._poll_camera_preview)
+
+    def _frame_to_photo(self, frame) -> tk.PhotoImage:
+        # Превью квадратное: берём центральный квадрат кадра, иначе широкая
+        # картинка оставляла бы пустые поля по бокам.
+        height, width = frame.shape[:2]
+        side = min(height, width)
+        top = (height - side) // 2
+        left = (width - side) // 2
+        frame = frame[top : top + side, left : left + side]
+        height, width = frame.shape[:2]
+        width_px = self.screen.CAMERA_WIDTH
+        height_px = self.screen.CAMERA_HEIGHT
+        scale = min(width_px / width, height_px / height)
+        target_w = max(1, int(width * scale))
+        target_h = max(1, int(height * scale))
+        resized = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_AREA)
+
+        canvas = np.full((height_px, width_px, 3), 36, dtype=np.uint8)
+        x0 = (width_px - target_w) // 2
+        y0 = (height_px - target_h) // 2
+        canvas[y0 : y0 + target_h, x0 : x0 + target_w] = resized
+
+        rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
+        header = f"P6\n{width_px} {height_px}\n255\n".encode("ascii")
+        return tk.PhotoImage(data=header + rgb.tobytes(), format="PPM")
+
+    # ------------------------------------------------------------- завершение
     def _on_close(self) -> None:
         if self._closing:
             return
         self._closing = True
         self._close_recommendation_notification()
-        self._close_camera_preview()
+        self._close_technical()
         try:
             self.monitor.close()
         except Exception:
@@ -877,13 +672,15 @@ class RecoveryAssistantApp:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Пользовательский MVP ассистента восстановления.")
+    parser = argparse.ArgumentParser(
+        description="Ассистент восстановления: локальная оценка рабочей нагрузки."
+    )
     parser.add_argument(
         "--demo",
         action="store_true",
         help=(
-            "Показать тестовую рекомендацию по ускоренным временным порогам. "
-            "В этом режиме уведомление не является выводом об усталости."
+            "Ускоренные временные пороги для проверки интерфейса. "
+            "Уведомление в этом режиме не является выводом об усталости."
         ),
     )
     return parser.parse_args()
@@ -891,7 +688,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    root = tk.Tk()
+    ctk.set_appearance_mode("dark")
+    root = ctk.CTk()
     RecoveryAssistantApp(root, demo_mode=args.demo)
     root.mainloop()
 

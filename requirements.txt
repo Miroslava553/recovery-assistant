@@ -2,3 +2,4 @@
 mediapipe==0.10.14
 opencv-python>=4.8,<5
 numpy>=1.24
+customtkinter>=5.2,<6

@@ -127,6 +127,7 @@ class MainScreen(ctk.CTkFrame):
         self._on_toggle_details = on_toggle_details
         self._details_open = False
         self._camera_visible = False
+        self._camera_placeholder: int | None = None
         self._reason_rows: list[tuple[ctk.CTkFrame, Pill, ctk.CTkLabel]] = []
         self._detail_cards: list[tuple[Card, ctk.CTkLabel, ctk.CTkLabel]] = []
 
@@ -342,12 +343,41 @@ class MainScreen(ctk.CTkFrame):
         )
         self.camera_canvas.pack(padx=7, pady=7)
 
+        # Пустой чёрный квадрат выглядит как поломка. Пока кадра нет, на
+        # холсте стоит надпись; первый пришедший кадр стирает холст целиком
+        # и надпись вместе с ним.
+        self._camera_placeholder = self.camera_canvas.create_text(
+            self.CAMERA_WIDTH // 2,
+            self.CAMERA_HEIGHT // 2,
+            text="ожидание кадра с камеры",
+            fill=theme.TEXT_DIM,
+            font=(theme.FONT_FAMILY, 12),
+            width=self.CAMERA_WIDTH - 40,
+            justify="center",
+        )
+
         ctk.CTkLabel(
             inner,
             text="не сохраняется и никуда не отправляется",
             font=_font(11),
             text_color=theme.TEXT_DIM,
         ).pack(anchor="w", pady=(8, 0))
+
+    def set_camera_placeholder(self, text: str) -> None:
+        """Заменить надпись на месте кадра.
+
+        Нужна там, где показывать нечего по разным причинам: в просмотре
+        интерфейса камеры нет вовсе, в работе она может быть занята другой
+        программой. Молчаливый чёрный квадрат в обоих случаях читается как
+        ошибка.
+        """
+
+        if self._camera_placeholder is None:
+            return
+        try:
+            self.camera_canvas.itemconfigure(self._camera_placeholder, text=text)
+        except tk.TclError:
+            pass
 
     @property
     def camera_visible(self) -> bool:

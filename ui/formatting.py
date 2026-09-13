@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+from dataclasses import fields, is_dataclass
+
 from app_core.recovery_engine import RecoveryAssessment, WorkloadLevel
 from app_core.state_machine import UserState
 
@@ -72,6 +74,26 @@ def user_facing_summary(
             "Рабочий контекст пока недостаточно определён для устойчивого вывода.",
         )
     return assessment.workload_title, assessment.workload_summary
+
+
+def dataclass_items(obj) -> list[tuple[str, object]]:
+    """Пары «поле — значение» для датакласса, в устойчивом порядке.
+
+    Панель технических показателей собирала поля через `vars()`. Он
+    работает только у объектов со словарём атрибутов, а `TypingMetrics` и
+    `OcularMetrics` объявлены с `slots=True` — словаря у них нет, и вызов
+    падал с TypeError. Панель не открывалась ни разу и заодно роняла цикл
+    опроса: на экране появлялось «Ошибка датчика», хотя датчики работали.
+
+    Порядок полей отсортирован намеренно: панель перерисовывается раз в
+    секунду, и строки не должны прыгать между обновлениями.
+    """
+
+    if obj is None:
+        return [("нет данных", "—")]
+    if not is_dataclass(obj):
+        return [("значение", obj)]
+    return sorted((f.name, getattr(obj, f.name, None)) for f in fields(obj))
 
 
 def wrap_width(
