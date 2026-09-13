@@ -1,0 +1,10 @@
+STEP 7
+
+Запуск демо:
+python assistant_app.py --demo
+
+Запуск реального режима:
+python assistant_app.py
+
+Подробности изменений: CHANGELOG_STEP7.md
+Краткая инструкция: START_STEP7.txt

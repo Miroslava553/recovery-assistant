@@ -1,0 +1,31 @@
+BUILD VERIFICATION
+==================
+
+Completed checks:
+- python -m unittest discover -s tests -v
+  Result: Ran 97 tests, OK
+- python -m compileall -q .
+  Result: OK
+- SQLite PRAGMA quick_check
+  Result: ok
+- capture UI layout test
+  Result: camera pixels copied without scaling; side panel remains separate
+- capture controls
+  Result: Space/Enter/Escape and mouse buttons covered by tests
+- quality assessment
+  Result: multiple simultaneous rejection reasons, post-calibration filtering,
+  dominant reason and 85% admission rule covered by tests
+- existing-session quality command
+  Result: signals.csv + metadata.json -> quality_report.txt/json without video
+- synthetic capture save flow
+  Result: signals.csv, metadata.json and quality_report files created
+
+Important limitation:
+The build environment has no physical webcam. Real Windows camera capture,
+OpenCV mouse interaction, local codec availability and MediaPipe inference must
+still be checked on the target computer. The program now reports exact frame
+rejection reasons instead of hiding them behind one coverage percentage.
+
+- personal head-pose calibration
+  Result: nonstandard neutral geometry accepted; strong deviations rejected;
+  old absolute-quality sessions can be reassessed from saved ratios

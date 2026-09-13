@@ -1,0 +1,14 @@
+Build: fatigue_assistant_step4_working_mvp
+
+Verified in the build environment:
+- 104 automated tests: OK
+- Python compilation of all source files: OK
+- recovery engine unit tests: OK
+- local SQLite event storage tests: OK
+
+Not verifiable in the container:
+- physical webcam capture on Windows
+- Windows global keyboard hook with the user's device
+- actual appearance of the Tkinter UI on the user's display
+
+The eye channel remains diagnostic-only in recommendation decisions.
