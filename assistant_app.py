@@ -80,6 +80,9 @@ class RecoveryAssistantApp:
             typing_baseline_service=self.typing_baseline,
             target_visual_fps=20.0,
             include_diagnostic_frame=False,
+            # Basic mode: занятая или отсутствующая камера не должна мешать
+            # работе остальных каналов.
+            vision_required=False,
         )
         self.store = RecoveryEventStore(DATABASE_PATH, profile_id=self.profile_id)
 
@@ -343,8 +346,23 @@ class RecoveryAssistantApp:
             return
         self._monitor_running = True
         self.pause_button.configure(text="Приостановить")
-        self.monitor_badge_var.set("● Мониторинг включён")
-        self.store.log_event("monitor_started", payload={"demo_mode": self.demo_mode})
+        if self.monitor.vision_available:
+            self.monitor_badge_var.set("● Мониторинг включён")
+        else:
+            self.monitor_badge_var.set("● Мониторинг включён (без камеры)")
+            messagebox.showwarning(
+                "Камера недоступна",
+                "Визуальный канал отключён, остальные продолжают работать.\n\n"
+                f"Причина: {self.monitor.vision_unavailable_reason}",
+                parent=self.root,
+            )
+        self.store.log_event(
+            "monitor_started",
+            payload={
+                "demo_mode": self.demo_mode,
+                "vision_available": self.monitor.vision_available,
+            },
+        )
 
     def _poll(self) -> None:
         if self._closing:

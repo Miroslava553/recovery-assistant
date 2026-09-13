@@ -179,10 +179,14 @@ class FakeOcularTracker:
 
 
 class FakeStateManager:
+    def __init__(self) -> None:
+        self.signals = []
+
     def reset(self, *, now=None) -> None:
         pass
 
     def update(self, signals, *, now=None) -> StateDecision:
+        self.signals.append(signals)
         return StateDecision(
             state=UserState.ACTIVE_WORK,
             previous_state=UserState.UNKNOWN,
@@ -320,6 +324,128 @@ class SessionMonitorTests(unittest.TestCase):
         finally:
             monitor.close()
         self.assertEqual(ocular.reset_calls, [True])
+
+
+class BrokenCameraSensor(FakeFaceSensor):
+    """Камера занята другим приложением или отсутствует."""
+
+    def start(self) -> None:
+        raise RuntimeError("Не удалось открыть камеру.")
+
+
+class FakeScreenLockSensor:
+    def __init__(self, value: bool | None) -> None:
+        self.value = value
+        self.calls = 0
+
+    def is_locked(self) -> bool | None:
+        self.calls += 1
+        return self.value
+
+
+class CameraFallbackTests(unittest.TestCase):
+    def make_monitor(self, *, face_sensor, vision_required: bool):
+        return SessionMonitor(
+            face_sensor=face_sensor,
+            input_sensor=FakeInputSensor(),
+            typing_sensor=FakeTypingSensor(),
+            attention_analyzer=FakeAttentionAnalyzer(),
+            ocular_tracker=FakeOcularTracker(),
+            state_manager=FakeStateManager(),
+            background_visual_processing=False,
+            vision_required=False if not vision_required else True,
+        )
+
+    def test_missing_camera_stops_start_when_vision_required(self):
+        monitor = self.make_monitor(
+            face_sensor=BrokenCameraSensor(),
+            vision_required=True,
+        )
+        with self.assertRaises(RuntimeError):
+            monitor.start()
+
+    def test_basic_mode_starts_without_camera(self):
+        """Остальные каналы должны продолжать работать без камеры."""
+
+        monitor = self.make_monitor(
+            face_sensor=BrokenCameraSensor(),
+            vision_required=False,
+        )
+        try:
+            monitor.start()
+            snapshot = monitor.snapshot()
+        finally:
+            monitor.close()
+
+        self.assertFalse(monitor.vision_available)
+        self.assertIsNotNone(monitor.vision_unavailable_reason)
+        self.assertIsNotNone(snapshot.typing_metrics)
+
+    def test_missing_camera_is_unknown_not_absent_face(self):
+        """face_detected=None означает «неизвестно», а не «человека нет»."""
+
+        monitor = self.make_monitor(
+            face_sensor=BrokenCameraSensor(),
+            vision_required=False,
+        )
+        try:
+            monitor.start()
+            snapshot = monitor.snapshot()
+        finally:
+            monitor.close()
+        self.assertIsNone(snapshot.face_detected)
+
+    def test_working_camera_keeps_vision_available(self):
+        monitor = self.make_monitor(
+            face_sensor=FakeFaceSensor(),
+            vision_required=False,
+        )
+        try:
+            monitor.start()
+            monitor.snapshot()
+        finally:
+            monitor.close()
+        self.assertTrue(monitor.vision_available)
+        self.assertIsNone(monitor.vision_unavailable_reason)
+
+
+class ScreenLockWiringTests(unittest.TestCase):
+    def make_monitor(self, lock_sensor):
+        return SessionMonitor(
+            face_sensor=FakeFaceSensor(),
+            input_sensor=FakeInputSensor(),
+            typing_sensor=FakeTypingSensor(),
+            attention_analyzer=FakeAttentionAnalyzer(),
+            ocular_tracker=FakeOcularTracker(),
+            state_manager=FakeStateManager(),
+            background_visual_processing=False,
+            screen_lock_sensor=lock_sensor,
+        )
+
+    def _signals_seen(self, lock_value):
+        sensor = FakeScreenLockSensor(lock_value)
+        monitor = self.make_monitor(sensor)
+        try:
+            monitor.start()
+            monitor.snapshot()
+        finally:
+            monitor.close()
+        return sensor, monitor.state_manager.signals[-1]
+
+    def test_locked_screen_reaches_state_machine(self):
+        sensor, signals = self._signals_seen(True)
+        self.assertGreaterEqual(sensor.calls, 1)
+        self.assertTrue(signals.screen_locked)
+
+    def test_unlocked_screen_reaches_state_machine(self):
+        _, signals = self._signals_seen(False)
+        self.assertFalse(signals.screen_locked)
+
+    def test_unknown_lock_state_is_not_treated_as_locked(self):
+        """Иначе на неподдерживаемой системе монитор навсегда уйдёт в AWAY."""
+
+        _, signals = self._signals_seen(None)
+        self.assertFalse(signals.screen_locked)
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ from typing import Any
 from app_core.face_presence import FacePresenceSensor, FacePresenceSnapshot
 from app_core.input_activity import InputActivityError, WindowsInputActivitySensor
 from app_core.ocular_activity import EyeActivityTracker, OcularMetrics
+from app_core.screen_lock import ScreenLockSensor
 from app_core.state_machine import PresenceSignals, UserState, UserStateManager
 from app_core.typing_activity import (
     GlobalKeyboardTimingSensor,
@@ -35,6 +36,7 @@ CAMERA_STATUS_LABELS: dict[str, str] = {
     "too_bright": "Слишком яркое освещение",
     "image_quality_too_low": "Изображение недостаточно чёткое",
     "camera_frame_unavailable": "Камера не передаёт изображение",
+    "camera_unavailable": "Камера недоступна; работа без визуального канала",
 }
 
 ATTENTION_STATUS_LABELS: dict[str, str] = {
@@ -122,6 +124,8 @@ class SessionMonitor:
         target_visual_fps: float = 30.0,
         background_visual_processing: bool = True,
         include_diagnostic_frame: bool = False,
+        screen_lock_sensor: ScreenLockSensor | None = None,
+        vision_required: bool = True,
     ) -> None:
         if target_visual_fps <= 0:
             raise ValueError("target_visual_fps должен быть больше нуля.")
@@ -190,7 +194,11 @@ class SessionMonitor:
         self.target_visual_fps = float(target_visual_fps)
         self.background_visual_processing = bool(background_visual_processing)
         self.include_diagnostic_frame = bool(include_diagnostic_frame)
+        self.screen_lock_sensor = screen_lock_sensor or ScreenLockSensor()
+        self.vision_required = bool(vision_required)
 
+        self._vision_available = True
+        self._vision_unavailable_reason: str | None = None
         self._manual_break = False
         self._running = False
         self._closed = False
@@ -208,6 +216,18 @@ class SessionMonitor:
         return self._running
 
     @property
+    def vision_available(self) -> bool:
+        """Работает ли визуальный канал в текущем запуске."""
+
+        return self._vision_available
+
+    @property
+    def vision_unavailable_reason(self) -> str | None:
+        """Почему камера не открылась, если она не открылась."""
+
+        return self._vision_unavailable_reason
+
+    @property
     def manual_break(self) -> bool:
         return self._manual_break
 
@@ -217,11 +237,21 @@ class SessionMonitor:
         if self._running:
             return
 
-        self.face_sensor.start()
+        self._vision_available = True
+        self._vision_unavailable_reason = None
+        try:
+            self.face_sensor.start()
+        except Exception as error:  # камера занята, отсутствует или запрещена
+            if self.vision_required:
+                raise
+            self._vision_available = False
+            self._vision_unavailable_reason = str(error) or error.__class__.__name__
+
         try:
             self.typing_sensor.start()
         except Exception:
-            self.face_sensor.stop()
+            if self._vision_available:
+                self.face_sensor.stop()
             raise
 
         now = time.monotonic()
@@ -350,7 +380,7 @@ class SessionMonitor:
             input_idle_sec=input_idle_sec,
             gaze_on_screen=gaze_on_screen,
             data_quality=data_quality,
-            screen_locked=False,
+            screen_locked=self._screen_locked(),
             manual_break=self._manual_break,
         )
         decision = self.state_manager.update(signals, now=captured_at)
@@ -406,6 +436,10 @@ class SessionMonitor:
 
     def _process_visual_once(self) -> None:
         captured_at = time.monotonic()
+        if not self._vision_available:
+            self._publish_visionless_bundle(captured_at)
+            return
+
         face = self.face_sensor.snapshot()
 
         frame_usable = (
@@ -467,6 +501,55 @@ class SessionMonitor:
         with self._visual_lock:
             self._visual_bundle = bundle
             self._visual_error = None
+
+    def _publish_visionless_bundle(self, captured_at: float) -> None:
+        """Собрать снимок без камеры.
+
+        Basic mode: остальные каналы (клавиатура, Windows idle, самооценка)
+        продолжают работать, а визуальный канал честно сообщает, что данных
+        нет. `face_detected=None` означает «неизвестно», а не «лица нет»:
+        отсутствие камеры не должно выглядеть как отсутствие человека.
+        """
+
+        face = FacePresenceSnapshot(
+            face_detected=None,
+            data_quality=0.0,
+            detection_confidence=0.0,
+            brightness=0.0,
+            sharpness=0.0,
+            reason="camera_unavailable",
+            frame=None,
+            face_box=None,
+        )
+        attention = self._empty_attention_snapshot(reason="face_not_available")
+        ocular = self.ocular_tracker.update(
+            None,
+            None,
+            face_detected=False,
+            data_quality=0.0,
+            left_eye_quality=0.0,
+            right_eye_quality=0.0,
+            head_pose_quality=0.0,
+            captured_at=captured_at,
+        )
+        bundle = _VisualBundle(
+            captured_at=captured_at,
+            face=face,
+            attention=attention,
+            ocular=ocular,
+        )
+        with self._visual_lock:
+            self._visual_bundle = bundle
+            self._visual_error = None
+
+    def _screen_locked(self) -> bool:
+        """Заблокирован ли экран сейчас.
+
+        Неизвестное состояние трактуется как «не заблокирован»: иначе на
+        неподдерживаемой системе монитор навсегда ушёл бы в AWAY.
+        """
+
+        return self.screen_lock_sensor.is_locked() is True
 
     def _observe_typing_baseline(
         self,
