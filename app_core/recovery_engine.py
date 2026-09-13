@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 from collections import Counter, deque
 from dataclasses import dataclass
-from enum import StrEnum
+from enum import IntEnum, StrEnum
 from typing import Mapping
 
 from app_core.baseline_engine import BaselineComparison, WorkContext
@@ -25,6 +25,7 @@ class RecommendationKind(StrEnum):
     EYE_REST = "eye_rest"
     MICROBREAK = "microbreak"
     RECOVERY_BREAK = "recovery_break"
+
 
 class AssessmentReliability(StrEnum):
     LIMITED = "limited"
@@ -95,6 +96,7 @@ class RecoverySignals:
     ocular_long_closure_count: int
     ocular_severe_closure_detected: bool
 
+
 @dataclass(frozen=True, slots=True)
 class RecoveryRecommendation:
     recommendation_id: int
@@ -157,6 +159,7 @@ class AdaptiveRecoveryEngine:
         microbreak_after_sec: float = 70.0 * 60.0,
         recovery_break_after_sec: float = 105.0 * 60.0,
         meaningful_break_sec: float = 180.0,
+        short_break_grace_sec: float = 30.0,
         alert_cooldown_sec: float = 25.0 * 60.0,
         typing_evaluation_interval_sec: float = 10.0,
         typing_persistence_samples: int = 3,
@@ -173,6 +176,8 @@ class AdaptiveRecoveryEngine:
             )
         if meaningful_break_sec <= 0 or alert_cooldown_sec < 0:
             raise ValueError("Параметры перерыва заданы неверно.")
+        if short_break_grace_sec < 0:
+            raise ValueError("short_break_grace_sec не может быть отрицательным.")
         if typing_evaluation_interval_sec <= 0:
             raise ValueError("Интервал проверки печати должен быть положительным.")
         if typing_persistence_samples < 1:
@@ -188,6 +193,7 @@ class AdaptiveRecoveryEngine:
         self.microbreak_after_sec = float(microbreak_after_sec)
         self.recovery_break_after_sec = float(recovery_break_after_sec)
         self.meaningful_break_sec = float(meaningful_break_sec)
+        self.short_break_grace_sec = float(short_break_grace_sec)
         self.alert_cooldown_sec = float(alert_cooldown_sec)
         self.typing_evaluation_interval_sec = float(typing_evaluation_interval_sec)
         self.typing_persistence_samples = int(typing_persistence_samples)
@@ -262,6 +268,33 @@ class AdaptiveRecoveryEngine:
         self._self_report_fatigue_sp = int(fatigue)
         self._self_report_sleepiness_kss = int(sleepiness)
         self._self_report_at = timestamp
+
+    def begin_manual_break(self) -> None:
+        """Начало перерыва по кнопке.
+
+        Счётчик перерыва всегда стартует с нуля, сколько бы времени ни
+        прошло с прошлого раза. Рабочая сессия при этом замирает, но не
+        обнуляется: решение о ней принимается в конце, по фактической
+        длительности перерыва.
+        """
+
+        self._current_break_sec = 0.0
+
+    def end_manual_break(self) -> None:
+        """Окончание перерыва по кнопке.
+
+        Короткое нажатие не должно стирать накопленную рабочую сессию:
+        человек мог нажать случайно или сразу передумать. Поэтому перерыв
+        короче `short_break_grace_sec` считается несостоявшимся, и работа
+        продолжается с того места, где остановилась. Более длинный перерыв
+        обнуляет сессию — в этом и смысл перерыва.
+        """
+
+        if self._current_break_sec > self.short_break_grace_sec:
+            self._continuous_work_sec = 0.0
+            self._typing_history.clear()
+            self._current_recommendation = None
+        self._current_break_sec = 0.0
 
     def snooze(self, *, minutes: float, captured_at: float) -> None:
         if minutes <= 0:
@@ -425,6 +458,17 @@ class AdaptiveRecoveryEngine:
                 self._continuous_work_sec = 0.0
                 self._current_recommendation = None
             return
+
+        # RETURNING и UNKNOWN: перерыв уже закончился, работа ещё не началась.
+        # Раньше счётчик перерыва обнулялся только при возобновлении работы,
+        # поэтому новый перерыв, начатый в защитный период, продолжал старое
+        # значение. Итог перерыва подводим здесь же, а не откладываем.
+        if self._current_break_sec > 0.0:
+            if self._current_break_sec >= self.meaningful_break_sec:
+                self._continuous_work_sec = 0.0
+                self._typing_history.clear()
+                self._current_recommendation = None
+            self._current_break_sec = 0.0
 
     def _update_typing_history(self, signals: RecoverySignals, now: float) -> None:
         if not signals.typing_data_ready or not signals.typing_baseline_ready:
@@ -638,6 +682,7 @@ class AdaptiveRecoveryEngine:
         evidence: list[RecoveryEvidence],
     ) -> LevelDecision:
         return derive_level_from_evidence(evidence)
+
     def _stabilize_workload_level(
         self,
         *,

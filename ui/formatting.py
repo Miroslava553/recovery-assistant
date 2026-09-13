@@ -14,9 +14,9 @@ def format_duration(seconds: float) -> str:
     total = max(0, int(round(seconds)))
     hours, remainder = divmod(total, 3600)
     minutes, secs = divmod(remainder, 60)
-    if hours:
-        return f"{hours:d}:{minutes:02d}:{secs:02d}"
-    return f"{minutes:02d}:{secs:02d}"
+    # Всегда часы:минуты:секунды. Формат «00:12» читается как двенадцать
+    # минут, хотя означает двенадцать секунд.
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
 def format_optional(value: object, *, digits: int = 2) -> str:

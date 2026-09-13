@@ -171,5 +171,143 @@ class AdaptiveRecoveryEngineTests(unittest.TestCase):
         self.assertEqual([int(level) for level in WorkloadLevel], [1, 2, 3, 4, 5])
 
 
+class BreakCounterResetTests(unittest.TestCase):
+    """Счётчик перерыва должен подводиться сразу, а не ждать работы."""
+
+    def _engine(self):
+        return AdaptiveRecoveryEngine(meaningful_break_sec=30.0)
+
+    def _feed(self, engine, state, *, start, seconds, step=1.0):
+        now = start
+        for _ in range(int(seconds / step)):
+            now += step
+            engine.update(signals(now, state=state))
+        return now
+
+    def test_new_break_after_returning_starts_from_zero(self):
+        """Раньше перерыв, начатый в защитный период, продолжал старый счёт."""
+
+        engine = self._engine()
+        now = 100.0
+        engine.update(signals(now, state=UserState.ACTIVE_WORK))
+        now = self._feed(engine, UserState.ACTIVE_WORK, start=now, seconds=10)
+        now = self._feed(engine, UserState.BREAK, start=now, seconds=5)
+        now = self._feed(engine, UserState.RETURNING, start=now, seconds=3)
+        assessment = engine.update(signals(now + 1.0, state=UserState.BREAK))
+        self.assertLessEqual(assessment.current_break_sec, 1.5)
+
+    def test_long_break_resets_work_even_without_resuming_work(self):
+        engine = self._engine()
+        now = 100.0
+        engine.update(signals(now, state=UserState.ACTIVE_WORK))
+        now = self._feed(engine, UserState.ACTIVE_WORK, start=now, seconds=20)
+        now = self._feed(engine, UserState.BREAK, start=now, seconds=35)
+        assessment = engine.update(signals(now + 1.0, state=UserState.RETURNING))
+        self.assertEqual(assessment.continuous_work_sec, 0.0)
+
+    def test_short_break_does_not_reset_work(self):
+        engine = self._engine()
+        now = 100.0
+        engine.update(signals(now, state=UserState.ACTIVE_WORK))
+        now = self._feed(engine, UserState.ACTIVE_WORK, start=now, seconds=20)
+        now = self._feed(engine, UserState.BREAK, start=now, seconds=5)
+        now = self._feed(engine, UserState.RETURNING, start=now, seconds=3)
+        assessment = engine.update(signals(now + 1.0, state=UserState.ACTIVE_WORK))
+        self.assertGreater(assessment.continuous_work_sec, 15.0)
+
+
+class ManualBreakGraceTests(unittest.TestCase):
+    """Короткое нажатие не стирает рабочую сессию, длинное — стирает."""
+
+    def _worked_engine(self, seconds: float = 40.0):
+        engine = AdaptiveRecoveryEngine(
+            meaningful_break_sec=180.0,
+            short_break_grace_sec=30.0,
+        )
+        now = 100.0
+        engine.update(signals(now, state=UserState.ACTIVE_WORK))
+        for _ in range(int(seconds)):
+            now += 1.0
+            engine.update(signals(now, state=UserState.ACTIVE_WORK))
+        return engine, now
+
+    def _hold_break(self, engine, now, seconds):
+        engine.begin_manual_break()
+        for _ in range(int(seconds)):
+            now += 1.0
+            engine.update(signals(now, state=UserState.BREAK))
+        return now
+
+    def test_break_counter_always_starts_from_zero(self):
+        engine, now = self._worked_engine()
+        now = self._hold_break(engine, now, 10)
+        engine.end_manual_break()
+        self.assertEqual(engine.current_break_sec, 0.0)
+
+        now = self._hold_break(engine, now, 3)
+        self.assertLessEqual(engine.current_break_sec, 3.5)
+
+    def test_short_break_keeps_the_work_session(self):
+        engine, now = self._worked_engine(seconds=40)
+        before = engine.continuous_work_sec
+        self._hold_break(engine, now, 10)
+        engine.end_manual_break()
+        self.assertAlmostEqual(engine.continuous_work_sec, before, delta=0.1)
+
+    def test_break_longer_than_grace_resets_the_work_session(self):
+        engine, now = self._worked_engine(seconds=40)
+        self._hold_break(engine, now, 35)
+        engine.end_manual_break()
+        self.assertEqual(engine.continuous_work_sec, 0.0)
+
+    def test_grace_boundary_is_inclusive(self):
+        """Ровно 30 секунд ещё считается случайным нажатием."""
+
+        engine, now = self._worked_engine(seconds=40)
+        before = engine.continuous_work_sec
+        self._hold_break(engine, now, 30)
+        engine.end_manual_break()
+        self.assertAlmostEqual(engine.continuous_work_sec, before, delta=0.1)
+
+    def test_long_break_also_drops_the_active_recommendation(self):
+        engine = AdaptiveRecoveryEngine(
+            eye_rest_after_sec=5.0,
+            microbreak_after_sec=10.0,
+            recovery_break_after_sec=15.0,
+            meaningful_break_sec=60.0,
+            short_break_grace_sec=2.0,
+            alert_cooldown_sec=0.0,
+        )
+        now = 0.0
+        engine.update(signals(now, state=UserState.ACTIVE_WORK))
+        for _ in range(8):
+            now += 1.0
+            engine.update(signals(now, state=UserState.ACTIVE_WORK))
+        self.assertIsNotNone(engine.current_recommendation)
+
+        engine.begin_manual_break()
+        for _ in range(5):
+            now += 1.0
+            engine.update(signals(now, state=UserState.BREAK))
+        engine.end_manual_break()
+        self.assertIsNone(engine.current_recommendation)
+
+    def test_automatic_away_still_needs_a_meaningful_pause(self):
+        """Автоматический уход живёт по своему порогу, а не по кнопочному."""
+
+        engine = AdaptiveRecoveryEngine(meaningful_break_sec=30.0)
+        now = 100.0
+        engine.update(signals(now, state=UserState.ACTIVE_WORK))
+        for _ in range(20):
+            now += 1.0
+            engine.update(signals(now, state=UserState.ACTIVE_WORK))
+        for _ in range(5):
+            now += 1.0
+            engine.update(signals(now, state=UserState.AWAY))
+        now += 1.0
+        assessment = engine.update(signals(now, state=UserState.ACTIVE_WORK))
+        self.assertGreater(assessment.continuous_work_sec, 15.0)
+
+
 if __name__ == "__main__":
     unittest.main()
