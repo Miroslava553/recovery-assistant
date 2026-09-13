@@ -3,10 +3,18 @@ from __future__ import annotations
 import math
 from collections import Counter, deque
 from dataclasses import dataclass
-from enum import IntEnum, StrEnum
+from enum import StrEnum
 from typing import Mapping
 
 from app_core.baseline_engine import BaselineComparison, WorkContext
+from app_core.evidence import (
+    NO_EVIDENCE_DECISION,
+    EvidenceSource,
+    LevelDecision,
+    RecoveryEvidence,
+    WorkloadLevel,
+    derive_level_from_evidence,
+)
 from app_core.session_monitor import SessionSnapshot
 from app_core.state_machine import UserState
 from app_core.typing_baseline import TypingBaselineService
@@ -17,29 +25,6 @@ class RecommendationKind(StrEnum):
     EYE_REST = "eye_rest"
     MICROBREAK = "microbreak"
     RECOVERY_BREAK = "recovery_break"
-
-
-class EvidenceSource(StrEnum):
-    SESSION = "session"
-    TYPING = "typing"
-    OCULAR = "ocular"
-    SELF_REPORT = "self_report"
-
-
-class WorkloadLevel(IntEnum):
-    """Пять пользовательских уровней наблюдаемой рабочей нагрузки.
-
-    Это не проценты усталости и не медицинские категории. Каждый уровень
-    существует потому, что меняет поведение ассистента: от наблюдения до
-    приоритетного восстановления.
-    """
-
-    STABLE = 1
-    EARLY = 2
-    SUSTAINED = 3
-    EXPRESSED = 4
-    RECOVERY_PRIORITY = 5
-
 
 class AssessmentReliability(StrEnum):
     LIMITED = "limited"
@@ -109,21 +94,6 @@ class RecoverySignals:
     ocular_perclos: float | None
     ocular_long_closure_count: int
     ocular_severe_closure_detected: bool
-
-
-@dataclass(frozen=True, slots=True)
-class RecoveryEvidence:
-    code: str
-    source: EvidenceSource
-    severity: int
-    title: str
-    detail: str
-    decision_ready: bool
-
-    def __post_init__(self) -> None:
-        if self.severity not in {1, 2, 3}:
-            raise ValueError("severity должен быть 1, 2 или 3.")
-
 
 @dataclass(frozen=True, slots=True)
 class RecoveryRecommendation:
@@ -249,6 +219,13 @@ class AdaptiveRecoveryEngine:
         self._pending_workload_level: WorkloadLevel | None = None
         self._pending_workload_count = 0
         self._last_raw_workload_level = WorkloadLevel.STABLE
+        self._last_level_decision: LevelDecision = NO_EVIDENCE_DECISION
+
+    @property
+    def last_level_decision(self) -> LevelDecision:
+        """Какое правило дало текущий уровень и почему."""
+
+        return self._last_level_decision
 
     @property
     def continuous_work_sec(self) -> float:
@@ -318,6 +295,8 @@ class AdaptiveRecoveryEngine:
         return {
             "stable_workload_level": int(self._stable_workload_level),
             "raw_workload_level": int(self._last_raw_workload_level),
+            "level_rule_id": self._last_level_decision.rule_id,
+            "level_rule_explanation": self._last_level_decision.explanation,
             "pending_workload_level": (
                 int(self._pending_workload_level)
                 if self._pending_workload_level is not None
@@ -346,13 +325,11 @@ class AdaptiveRecoveryEngine:
         self._update_typing_history(signals, now)
 
         evidence = self._build_evidence(signals, now)
-        raw_level = self._derive_workload_level(signals, evidence)
+        decision = self._derive_level_decision(evidence)
+        raw_level = decision.level
         self._last_raw_workload_level = raw_level
-        urgent = any(
-            item.decision_ready
-            and item.code in {"self_report_very_high", "severe_eye_closure"}
-            for item in evidence
-        )
+        self._last_level_decision = decision
+        urgent = decision.urgent
         stable_level = self._stabilize_workload_level(
             signals=signals,
             target=raw_level,
@@ -647,37 +624,20 @@ class AdaptiveRecoveryEngine:
         signals: RecoverySignals,
         evidence: list[RecoveryEvidence],
     ) -> WorkloadLevel:
-        ready = [item for item in evidence if item.decision_ready]
-        ready_codes = {item.code for item in ready}
-        sources = {item.source for item in ready}
-        max_severity = max((item.severity for item in ready), default=0)
-        typing_count = sum(item.source is EvidenceSource.TYPING for item in ready)
+        """Совместимая обёртка: вернуть только уровень.
 
-        if "self_report_very_high" in ready_codes or "severe_eye_closure" in ready_codes:
-            return WorkloadLevel.RECOVERY_PRIORITY
+        Правила живут в `app_core.evidence`. Полное решение вместе с
+        идентификатором сработавшего правила доступно через
+        `_derive_level_decision`.
+        """
 
-        # Выраженная нагрузка: один сильный субъективный сигнал либо согласование
-        # не менее двух независимых каналов, где есть хотя бы умеренный признак.
-        if "self_report_strong" in ready_codes:
-            return WorkloadLevel.EXPRESSED
-        if len(sources) >= 2 and max_severity >= 2:
-            return WorkloadLevel.EXPRESSED
-        if "very_long_continuous_work" in ready_codes:
-            return WorkloadLevel.EXPRESSED
+        return self._derive_level_decision(evidence).level
 
-        # Устойчивый уровень: длительная сессия, два устойчивых изменения печати,
-        # либо умеренная самооценка, подтверждённая ещё одним каналом.
-        if "long_continuous_work" in ready_codes:
-            return WorkloadLevel.SUSTAINED
-        if typing_count >= 2:
-            return WorkloadLevel.SUSTAINED
-        if "self_report_moderate" in ready_codes and len(sources) >= 2:
-            return WorkloadLevel.SUSTAINED
-
-        if ready:
-            return WorkloadLevel.EARLY
-        return WorkloadLevel.STABLE
-
+    def _derive_level_decision(
+        self,
+        evidence: list[RecoveryEvidence],
+    ) -> LevelDecision:
+        return derive_level_from_evidence(evidence)
     def _stabilize_workload_level(
         self,
         *,
